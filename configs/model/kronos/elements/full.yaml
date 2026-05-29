@@ -1,0 +1,47 @@
+# @package model.backbone
+# KRONOS element set — every element with atomic number <= 36 (Kr).
+# Number of expert modules = K * (K + 1) / 2 = 36 * 37 / 2 = 666.
+# Use only when training on chemically diverse data; for HCNO-class
+# molecules prefer ``elements: hcno``.
+
+elements:
+  [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36,
+  ]
+dressing_kwargs:
+  num_elements: 37

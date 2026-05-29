@@ -1,0 +1,30 @@
+# @package model
+# GOAL Model Configuration — KRONOS (monolithic).
+#
+# Self-contained variant of KRONOS that bypasses the backbone→head
+# split — the model returns the property dictionary directly.  Useful
+# for inference deployments or single-file demos.  ``head`` is null so
+# the training loop calls the model directly.
+#
+# Force-prediction modes (autograd/direct/hybrid) live inline on the
+# backbone (``forces_mode``, ``correction_weight``) — there is no
+# separate head wiring.
+
+defaults:
+  - kronos/elements: hcno
+  - kronos/dressing: default
+  - kronos/experts: linear
+  - _self_
+
+backbone:
+  name: kronos_monolithic
+  cutoff: ${model.backbone.dressing_kwargs.cutoff}
+
+  # Inline force-prediction settings (mirror what ``dual_forces``
+  # exposes for the modular variant).  Choose ``autograd`` (default),
+  # ``direct`` or ``hybrid``.
+  forces_mode: autograd
+  correction_weight: 0.0
+
+# No head — monolithic model returns property dict directly.
+head: null

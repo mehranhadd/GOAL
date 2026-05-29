@@ -64,9 +64,11 @@ class GOALCalculator(Calculator):
         saved config automatically.
     device : str
         Torch device — ``"cpu"``, ``"cuda"``, ``"cuda:0"``, etc.
-    dtype : torch.dtype
-        Precision for atomic positions and cell.  Should match the model
-        training dtype (usually ``torch.float64``).
+    dtype : torch.dtype or None
+        Precision for atomic positions and cell.  When ``None`` (the
+        recommended default) the calculator sniffs the dtype of the
+        loaded model's parameters and uses that, so the inputs always
+        match the model.  Pass an explicit dtype only to override.
     head : str or None
         Multi-head tag for models trained with multiple heads.
     **kwargs
@@ -85,7 +87,7 @@ class GOALCalculator(Calculator):
         module: typing.Any | None = None,
         cutoff: float | None = None,
         device: str = "cpu",
-        dtype: torch.dtype = torch.float64,
+        dtype: torch.dtype | None = None,
         head: str | None = None,
         **kwargs: typing.Any,
     ) -> None:
@@ -97,7 +99,6 @@ class GOALCalculator(Calculator):
             raise ValueError("Provide either 'checkpoint_path' or 'module'.")
 
         self.device: torch.device = torch.device(device)
-        self.dtype: torch.dtype = dtype
         self.head: str | None = head
 
         if checkpoint_path is not None:
@@ -110,6 +111,16 @@ class GOALCalculator(Calculator):
 
         self._module = self._module.to(self.device)
         self._module.eval()
+
+        # Default the input dtype to the model's actual parameter dtype so
+        # the AtomicGraph never disagrees with the network it feeds.  An
+        # explicit ``dtype=...`` still wins.
+        if dtype is None:
+            try:
+                dtype = next(self._module.parameters()).dtype
+            except StopIteration:
+                dtype = torch.float64
+        self.dtype: torch.dtype = dtype
 
     def _load_checkpoint(
         self,

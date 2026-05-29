@@ -36,10 +36,15 @@ class WeightedTensorProduct(nn.Module):
         self.irreps_in1 = Irreps(irreps_in1)
         self.irreps_in2 = Irreps(irreps_in2)
         self.irreps_out = Irreps(irreps_out)
+        # Per-edge external weights from a radial MLP: turn off both
+        # weight sharing and internal weights so e3nn accepts a
+        # ``(E, weight_numel)`` tensor at forward time.
         self._tp = FullyConnectedTensorProduct(
             irreps_in1=self.irreps_in1,
             irreps_in2=self.irreps_in2,
             irreps_out=self.irreps_out,
+            shared_weights=False,
+            internal_weights=False,
         )
 
     @property

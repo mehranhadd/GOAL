@@ -5,10 +5,10 @@
 defaults:
   - _self_
   - data: xyz
-  - model: hyperspec
+  - model: kronos
   - training: default
   - callbacks: default
-  - logger: null # set logger here or use command line (e.g. `python train.py logger=wandb`)
+  - logger: csv # set logger here or use command line (e.g. `python train.py logger=wandb`)
   - trainer: default
   - paths: default
   - extras: default

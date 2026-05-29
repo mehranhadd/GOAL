@@ -1,18 +1,22 @@
 """Central registry system for extensible component discovery.
 
-The registry is the backbone of GOAL's extensibility. It supports three
-registration mechanisms simultaneously and uses lazy loading to avoid
-import side effects:
+The registry is the backbone of GOAL's extensibility. It supports four
+registration mechanisms:
 
 1. **Decorator registration** — for built-in classes within GOAL itself.
 2. **Lazy registration** — zero import cost; loads only when requested.
 3. **Entry-point plugin discovery** — third-party packages declare
    entry points in their ``pyproject.toml``.
+4. **Package auto-discovery** (see :func:`auto_discover`) — walk a
+   package and import every submodule so the ``@register`` decorators
+   inside them fire automatically.  Drop a new module in the folder and
+   it is registered without touching any ``__init__.py``.
 """
 
 from __future__ import annotations
 
 import importlib
+import pkgutil
 import typing
 import warnings
 from importlib.metadata import entry_points
@@ -169,3 +173,52 @@ DATASET_REGISTRY = Registry("datasets")
 HEAD_REGISTRY = Registry("heads")
 TRANSFORM_REGISTRY = Registry("transforms")
 STRATEGY_REGISTRY = Registry("strategies")
+
+
+# ---------------------------------------------------------------------------
+# Package auto-discovery
+# ---------------------------------------------------------------------------
+
+
+def auto_discover(package_name: str) -> None:
+    """Import every submodule of ``package_name`` so decorator-based
+    ``@<REGISTRY>.register("name")`` calls inside them fire automatically.
+
+    Use this in a package's ``__init__.py`` instead of listing every
+    submodule by hand.  A new file dropped into the folder is picked up
+    on the next import — no ``__init__.py`` change, no double source of
+    truth, no "I forgot to register the BACKBONE alongside the MODEL"
+    bug.  All registries declared in this module receive whichever
+    decorators fire inside the discovered modules.
+
+    Parameters
+    ----------
+    package_name : str
+        Dotted name of a package, e.g. ``"goal.ml.nn.models"``.  Must
+        actually be a package (have ``__path__``); a plain module
+        raises ``ValueError``.
+
+    Notes
+    -----
+    * Modules that fail to import emit a ``UserWarning`` and are
+      skipped — the rest of discovery still runs.  This matches the
+      behaviour of :meth:`Registry.discover_plugins` for entry points.
+    * Safe to call from within the target package's own ``__init__.py``
+      (``walk_packages`` only enumerates submodules, not the package
+      itself, so no recursion).
+    """
+    package = importlib.import_module(package_name)
+    if not hasattr(package, "__path__"):
+        raise ValueError(
+            f"auto_discover('{package_name}') requires a package, " f"not a plain module."
+        )
+    for _finder, modname, _ispkg in pkgutil.walk_packages(
+        package.__path__, prefix=f"{package_name}."
+    ):
+        try:
+            importlib.import_module(modname)
+        except ImportError as e:
+            warnings.warn(
+                f"auto_discover skipped '{modname}': {e}",
+                stacklevel=2,
+            )

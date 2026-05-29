@@ -16,10 +16,11 @@ from goal.ml.data.graph import AtomicGraph, NodeFeatures
 from goal.ml.nn.blocks.embedding import AtomicNumberEmbedding
 from goal.ml.nn.blocks.interaction import EquivariantInteractionBlock
 from goal.ml.nn.primitives.linear import EquivariantLinear
-from goal.ml.registry import MODEL_REGISTRY
+from goal.ml.registry import BACKBONE_REGISTRY, MODEL_REGISTRY
 
 
 @MODEL_REGISTRY.register("hyperspec")
+@BACKBONE_REGISTRY.register("hyperspec")
 class HyperSpecModel(nn.Module):
     """Native GOAL equivariant graph neural network.
 

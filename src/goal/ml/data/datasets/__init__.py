@@ -1,10 +1,12 @@
-"""GOAL dataset implementations."""
+"""GOAL dataset implementations.
+
+Drop a new ``.py`` file into this folder with
+``@DATASET_REGISTRY.register("name")`` on its class and it is discovered
+automatically — no edit to this file required.
+"""
 
 from __future__ import annotations
 
-from goal.ml.registry import DATASET_REGISTRY
+from goal.ml.registry import auto_discover
 
-DATASET_REGISTRY.register_lazy("xyz", "goal.ml.data.datasets.xyz:ExtXYZDataset")
-DATASET_REGISTRY.register_lazy("hdf5", "goal.ml.data.datasets.hdf5:HDF5Dataset")
-DATASET_REGISTRY.register_lazy("lmdb", "goal.ml.data.datasets.lmdb:LMDBDataset")
-DATASET_REGISTRY.register_lazy("trajectory", "goal.ml.data.datasets.trajectory:TrajectoryDataset")
+auto_discover(__name__)

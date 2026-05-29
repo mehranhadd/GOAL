@@ -24,10 +24,11 @@ from torch_geometric.utils import scatter
 
 from goal.ml.data.graph import AtomicGraph
 from goal.ml.nn.blocks.embedding import AtomicNumberEmbedding
-from goal.ml.registry import MODEL_REGISTRY
+from goal.ml.registry import BACKBONE_REGISTRY, MODEL_REGISTRY
 
 
 @MODEL_REGISTRY.register("monolithic_example")
+@BACKBONE_REGISTRY.register("monolithic_example")
 class MonolithicExample(nn.Module):
     """Minimal monolithic model for demonstration purposes.
 

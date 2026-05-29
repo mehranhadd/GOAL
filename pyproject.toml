@@ -28,7 +28,7 @@ dependencies = [
   "rich>=13",
   "rootutils",
   "hydra-colorlog",
-  "lmdb", "pytest>=9.0.3,<10",
+  "lmdb", "pytest>=9.0.3,<10", "ipython>=9.13.0,<10", "xonsh>=0.23.7,<0.24",
 ]
 
 [project.optional-dependencies]
@@ -40,17 +40,28 @@ deepspeed = ["deepspeed>=0.14"]
 tune = ["ray[tune]>=2.55.1", "optuna>=3.0"]
 torchmetrics = ["torchmetrics>=1.9.0"]
 examples = ["h5py>=3.10", "requests>=2.31"]
+md = [
+  "flashmd>=0.2.5,<0.3",
+  "ase>=3.25.0,<4",
+  "xtb-python>=22.1,<23",
+  "rdkit>=2025.9.3,<2026",
+  "typer>=0.16.0,<0.17",
+  "pandas>=2.3.0,<3",
+  "ipi>=3.0",
+]
 dev = ["pytest>=7", "pytest-cov", "ruff", "mypy"]
-all = ["goal[mace,fairchem,matscipy,nvalchemiops,deepspeed,tune,torchmetrics,examples]"]
+all = ["goal[mace,fairchem,matscipy,nvalchemiops,deepspeed,tune,torchmetrics,examples,md]"]
 
 [project.urls]
-Repository = "https://github.com/Nourollah/MC-GLOW"
+Repository = "https://github.com/Nourollah/GOAL"
 
 [project.scripts]
 goal-train = "goal.ml.cli.train:train"
 goal-eval = "goal.ml.cli.evaluate:evaluate"
 goal-finetune = "goal.ml.cli.finetune:finetune"
 goal-tune = "goal.ml.cli.tune:tune"
+goal-simulate = "goal.md.cli.simulate:simulate"
+goal-simulate-mts = "goal.md.cli.simulate:simulate_mts"
 
 # src/ is the source root: packages under src/ are importable directly
 # e.g. src/goal/ → import goal; src/goal/ml/ → from goal.ml import ...
@@ -74,7 +85,7 @@ markers = [
   "slow: slow tests",
 ]
 minversion = "6.0"
-testpaths = "tests/"
+testpaths = ["tests/", "tests/ml/", "tests/md/"]
 
 [tool.coverage.report]
 exclude_lines = [
@@ -193,3 +204,5 @@ typecheck = "mypy src/goal/ml/"
 train = "python -m goal.ml.cli.train"
 eval = "python -m goal.ml.cli.evaluate"
 finetune = "python -m goal.ml.cli.finetune"
+simulate = "python -m goal.md.cli.simulate"
+simulate-mts = "python -m goal.md.cli.simulate simulate_mts"

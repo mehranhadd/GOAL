@@ -40,8 +40,19 @@ class EMAWrapper:
 
     @torch.no_grad()
     def update(self) -> None:
-        """Update shadow parameters with current model parameters."""
-        for shadow, param in zip(self._shadow, self._parameters):
+        """Update shadow parameters with current model parameters.
+
+        Shadow tensors are cloned at construction time but Lightning may
+        later move the model to a different dtype/device (e.g. via
+        ``precision="64-true"``).  Bring each shadow into the current
+        parameter's dtype/device before the in-place ``lerp_`` so the
+        update doesn't fail with ``RuntimeError: expected dtype float
+        for 'end' but got dtype double``.
+        """
+        for idx, (shadow, param) in enumerate(zip(self._shadow, self._parameters)):
+            if shadow.dtype != param.dtype or shadow.device != param.device:
+                shadow = shadow.to(dtype=param.dtype, device=param.device)
+                self._shadow[idx] = shadow
             shadow.lerp_(param.data, 1.0 - self.decay)
 
     @contextmanager

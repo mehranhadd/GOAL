@@ -74,9 +74,13 @@ class EnergyForcesHead(nn.Module):
         dict[str, Tensor]
             ``{'energy': (B,), 'forces': (N, 3), ...}``
         """
-        # Per-node scalar contribution
-        node_energies: torch.Tensor = self.readout(features.node_feats)  # (N, 1)
-        node_energies = node_energies.squeeze(-1)  # (N,)
+        # Per-node scalar contribution.  Honour pre-computed energies
+        # supplied by the backbone (e.g. KRONOS) and fall back to the
+        # scalar readout when they are absent.
+        if features.node_energies is not None:
+            node_energies: torch.Tensor = features.node_energies  # (N,)
+        else:
+            node_energies = self.readout(features.node_feats).squeeze(-1)  # (N,)
 
         # Sum per graph to get total energy
         batch: torch.Tensor = (

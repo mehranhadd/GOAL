@@ -22,6 +22,7 @@ from lightning.pytorch.callbacks import LearningRateMonitor
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
 
+from goal.ml.cli import CONFIGS_DIR
 from goal.ml.data.datamodule import GOALDataModule
 from goal.ml.registry import BACKBONE_REGISTRY, HEAD_REGISTRY, LOSS_REGISTRY
 from goal.ml.training.callbacks.checkpoint import GOALCheckpoint
@@ -125,7 +126,7 @@ def _build_backbone(backbone_cfg: DictConfig) -> typing.Any:
     return adapter_cls(**backbone_kwargs)
 
 
-@hydra.main(version_base=None, config_path="../../../configs", config_name="train")
+@hydra.main(version_base=None, config_path=CONFIGS_DIR, config_name="train")
 def finetune(cfg: DictConfig) -> None:
     """GOAL fine-tuning entry point.
 

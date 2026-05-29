@@ -21,7 +21,7 @@ from torch_geometric.utils import scatter
 from goal.ml.data.graph import AtomicGraph, NodeFeatures
 from goal.ml.nn.blocks.embedding import AtomicNumberEmbedding
 from goal.ml.nn.primitives.radial import BesselBasis, RadialMLP
-from goal.ml.registry import MODEL_REGISTRY
+from goal.ml.registry import BACKBONE_REGISTRY, MODEL_REGISTRY
 
 
 class ContinuousFilterConv(nn.Module):
@@ -60,6 +60,11 @@ class ContinuousFilterConv(nn.Module):
         col: torch.Tensor
         row, col = edge_index  # (E,), (E,)
         basis: torch.Tensor = self.basis(edge_lengths)  # (E, num_basis)
+        # ``BesselBasis`` stores its freqs buffer in float64 and emits
+        # float64 regardless of the input dtype; cast to the filter net's
+        # weight dtype so the boundary is explicit (same pattern as
+        # ``RadialMLP``).
+        basis = basis.to(self.filter_net[0].weight.dtype)
         filters: torch.Tensor = self.filter_net(basis)  # (E, hidden_dim)
         messages: torch.Tensor = node_feats[col] * filters  # (E, hidden_dim)
         aggregated: torch.Tensor = scatter(
@@ -69,6 +74,7 @@ class ContinuousFilterConv(nn.Module):
 
 
 @MODEL_REGISTRY.register("invariant_gnn")
+@BACKBONE_REGISTRY.register("invariant_gnn")
 class InvariantGNN(nn.Module):
     """Invariant graph neural network backbone.
 

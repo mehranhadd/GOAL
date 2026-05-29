@@ -1,0 +1,25 @@
+# @package _global_
+# Train the simple SchNet-style InvariantGNN baseline on the GMD
+# FragmentDuplication task.  Use this to verify the data pipeline and
+# loss machinery can fit *something* before debugging fancier models.
+#
+# Usage:
+#   pixi run -e cuda train experiment=simple_gnn
+#
+# In-distribution validation uses TestID; out-of-distribution evaluation
+# uses TestOOD (Lightning's ``trainer.test`` is run after training when
+# ``test: true`` in train.yaml, which is the default).
+
+defaults:
+  - override /data: gmd_fragment_duplication
+  - override /model: invariant_gnn
+
+# Match the model's receptive field to the data's neighbour-list cutoff
+# (the GMD dataset builds edges up to 8 Å; using a 5 Å model on 8 Å edges
+# wastes the long-range edges via the Bessel basis without a smooth
+# envelope).
+model:
+  backbone:
+    cutoff: ${data.cutoff}
+
+tags: ["gnn", "gmd", "fragment_duplication", "baseline"]

@@ -169,7 +169,7 @@ class LayerBackbone:
     Example::
 
         backbone = LayerBackbone(mace_adapter, layer=0)
-        head = DeepSetHead(irreps_in=str(backbone.irreps_out), ...)
+        head = EnergyForcesHead(irreps_in=str(backbone.irreps_out), ...)
         module = GOALModule(backbone=backbone, head=head, ...)
     """
 
@@ -308,7 +308,7 @@ class FrozenBackbone:
     Example::
 
         frozen = FrozenBackbone(MultiScaleBackbone(mace_adapter))
-        head = DeepSetHead(...)
+        head = EnergyForcesHead(irreps_in=str(frozen.irreps_out), ...)
         module = GOALModule(backbone=frozen, head=head, ...)
         # Only head parameters appear in the optimiser
     """

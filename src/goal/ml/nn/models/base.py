@@ -93,9 +93,10 @@ class FeatureExtractorBackbone(typing.Protocol):
     feature extraction.
 
     Any backbone implementing this can serve as a feature extractor for
-    downstream models like DeepSet or HyperSet. Extends the
-    ``EquivariantBackbone`` contract — any ``FeatureExtractorBackbone``
-    is also a valid ``EquivariantBackbone``.
+    downstream heads or wrappers (e.g. ``LayerBackbone``,
+    ``MultiScaleBackbone``).  Extends the ``EquivariantBackbone``
+    contract — any ``FeatureExtractorBackbone`` is also a valid
+    ``EquivariantBackbone``.
 
     The ``extract_features`` method provides access to intermediate
     interaction-layer outputs, enabling multi-scale feature analysis

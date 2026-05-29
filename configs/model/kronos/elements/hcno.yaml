@@ -1,0 +1,11 @@
+# @package model.backbone
+# KRONOS element set — H, C, N, O.
+# Number of expert modules = K * (K + 1) / 2 = 10
+# (H-H, H-C, H-N, H-O, C-C, C-N, C-O, N-N, N-O, O-O).
+#
+# ``elements`` is the atomic-number list fed to the model.
+# ``dressing_kwargs.num_elements`` sizes the embedding table.
+
+elements: [1, 6, 7, 8]
+dressing_kwargs:
+  num_elements: 9

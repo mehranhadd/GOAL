@@ -1,0 +1,49 @@
+# @package model
+# GOAL Model Configuration — KRONOS (modular default).
+#
+# KRONOS = K-order Routed Orthogonal Network of Symmetry with
+# Element-Pair Mixture-of-Experts.
+#
+# **Default** KRONOS wiring for the project: an equivariant backbone
+# (``kronos``) feeding a task head.  The head receives the per-atom
+# pair-energy contributions from the backbone (via
+# ``NodeFeatures.node_energies``) and either uses them directly
+# (``dual_forces``, ``energy_forces``, ``energy``) or applies its own
+# scalar readout.
+#
+# Hierarchy:
+#   backbone.elements        — atomic-number list used by the experts
+#   backbone.dressing_kwargs — environment-dressing block parameters
+#                              (includes ``body_order`` for ACE
+#                              body-order expansion)
+#   backbone.expert_config   — per-expert architecture parameters
+#   backbone.cutoff          — cosine-cutoff radius for pairwise experts
+#   head                     — task head + force-prediction mode
+#
+# Swap any subsection from the command line, e.g.::
+#
+#   goal-train model=kronos model/kronos/experts=transformer
+#   goal-train model=kronos model/kronos/forces=hybrid
+#   goal-train model=kronos model/kronos/elements=full
+#   goal-train model=kronos model.backbone.dressing_kwargs.body_order=2
+#
+# For the self-contained ``head: null`` variant, see
+# ``configs/model/kronos_monolithic.yaml``.
+
+defaults:
+  - kronos/elements: hcno
+  - kronos/dressing: default
+  - kronos/experts: linear
+  - kronos/forces: autograd
+  - _self_
+
+backbone:
+  name: kronos
+  # Pairwise-expert cutoff.  Defaults to the dressing cutoff so that
+  # one knob controls both stages; override to decouple them.
+  cutoff: ${model.backbone.dressing_kwargs.cutoff}
+
+head:
+  name: dual_forces
+  irreps_in: "${model.backbone.dressing_kwargs.hidden_channels}x0e+${model.backbone.dressing_kwargs.hidden_channels}x1o+${model.backbone.dressing_kwargs.hidden_channels}x2e"
+  hidden_dim: 256

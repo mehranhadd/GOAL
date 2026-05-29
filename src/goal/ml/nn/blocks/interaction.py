@@ -96,6 +96,17 @@ class EquivariantInteractionBlock(nn.Module):
         """
         row, col = edge_index  # (E,), (E,)
 
+        # Boundary cast — same MACE / NequIP pattern as in radial.py.
+        # ASE-supplied edge geometry can be float64 while the learnable
+        # network is float32; aligning both edge_vectors (angular path,
+        # feeds spherical_harmonics → edge_sh → TP) and edge_lengths
+        # (radial path, feeds Bessel → RadialMLP → TP weights) to the
+        # node_feats dtype keeps the whole interaction block in a
+        # single precision without scattering ``to(...)`` calls deeper
+        # inside the equivariant primitives.
+        edge_vectors = edge_vectors.to(node_feats.dtype)
+        edge_lengths = edge_lengths.to(node_feats.dtype)
+
         # Spherical harmonics of edge directions
         edge_sh = spherical_harmonics(  # (E, irreps_edge.dim)
             self.irreps_edge,

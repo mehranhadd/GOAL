@@ -33,6 +33,7 @@ from lightning import Callback
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig, OmegaConf
 
+from goal.ml.cli import CONFIGS_DIR
 from goal.ml.data.datamodule import GOALDataModule
 from goal.ml.registry import BACKBONE_REGISTRY, HEAD_REGISTRY, LOSS_REGISTRY
 from goal.ml.training.loss import CompositeLoss, WeightedLoss
@@ -131,7 +132,7 @@ def _ray_train_fn(config: dict[str, typing.Any], base_cfg: DictConfig) -> None:
     report(val_metrics)
 
 
-@hydra.main(version_base=None, config_path="../../../configs", config_name="train")
+@hydra.main(version_base=None, config_path=CONFIGS_DIR, config_name="train")
 def tune(cfg: DictConfig) -> None:
     """GOAL hyperparameter tuning entry point.
 

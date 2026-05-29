@@ -1,0 +1,23 @@
+# @package model.backbone.expert_config
+# Linear-MLP expert (default).
+#
+# Each expert reads:
+#   - per-atom invariant scalars (scalar_channels)  ×2
+#   - the scalar pair distance                       ×1
+# and emits one scalar energy via the MLP described below.
+
+# Width of the invariant projection of each atom's dressed features.
+scalar_channels: 128
+
+# Hidden widths of the MLP, in order.  Final layer is always a linear
+# projection to a single scalar (no activation after it).  The default
+# ``[64, 32]`` reproduces the [in→64→32→1] head from the KRONOS spec.
+hidden_dims: [128, 64]
+
+# Backbone type — "linear" (default) or "transformer".
+expert_type: linear
+
+# Ignored when ``expert_type == linear``; kept so all expert configs
+# share the same schema.
+transformer_heads: 6
+transformer_layers: 2

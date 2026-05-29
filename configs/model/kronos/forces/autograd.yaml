@@ -1,0 +1,6 @@
+# @package model.head
+# Forces derived purely from -grad(E, positions).
+# Energy-conserving; the default choice for KRONOS.
+
+mode: autograd
+correction_weight: 0.0

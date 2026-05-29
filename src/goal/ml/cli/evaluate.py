@@ -14,6 +14,7 @@ from lightning import Callback
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
 
+from goal.ml.cli import CONFIGS_DIR
 from goal.ml.data.datamodule import GOALDataModule
 from goal.ml.registry import BACKBONE_REGISTRY, HEAD_REGISTRY, LOSS_REGISTRY
 from goal.ml.training.loss import CompositeLoss, WeightedLoss
@@ -59,7 +60,7 @@ def _build_head(cfg: DictConfig) -> typing.Any:
     return head_cls(**head_kwargs)
 
 
-@hydra.main(version_base=None, config_path="../../../configs", config_name="eval")
+@hydra.main(version_base=None, config_path=CONFIGS_DIR, config_name="eval")
 def evaluate(cfg: DictConfig) -> None:
     """GOAL evaluation entry point.
 

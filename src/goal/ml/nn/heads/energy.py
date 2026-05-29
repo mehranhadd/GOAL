@@ -51,7 +51,12 @@ class EnergyHead(nn.Module):
         features: NodeFeatures,
         graph: AtomicGraph,
     ) -> dict[str, torch.Tensor]:
-        node_energies: torch.Tensor = self.readout(features.node_feats).squeeze(-1)  # (N,)
+        # Prefer pre-computed per-atom energies (e.g. from KRONOS) when the
+        # backbone supplies them; otherwise apply our own scalar readout.
+        if features.node_energies is not None:
+            node_energies: torch.Tensor = features.node_energies  # (N,)
+        else:
+            node_energies = self.readout(features.node_feats).squeeze(-1)  # (N,)
 
         batch: torch.Tensor = (
             graph.batch

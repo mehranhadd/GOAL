@@ -36,6 +36,11 @@ class BesselBasis(nn.Module):
 
     def forward(self, distances: torch.Tensor) -> torch.Tensor:
         """Expand distances into Bessel basis, shape ``(E,) → (E, num_basis)``."""
+        # Cast distances to the buffer dtype so the multiplication and the
+        # subsequent ops stay in a single, well-defined precision.  This is
+        # the first point of contact between the (ASE-supplied) raw edge
+        # lengths and the radial branch — same pattern as MACE / NequIP.
+        distances = distances.to(self.freqs.dtype)
         d: torch.Tensor = distances.unsqueeze(-1)  # (E, 1)
         return (2.0 / self.cutoff) ** 0.5 * torch.sin(self.freqs * d) / d  # (E, num_basis)
 
@@ -103,5 +108,11 @@ class RadialMLP(nn.Module):
         self.net: nn.Sequential = nn.Sequential(*layers)
 
     def forward(self, basis: torch.Tensor) -> torch.Tensor:
-        """Map radial basis features to weights, shape ``(E, num_basis) → (E, num_out)``."""
-        return self.net(basis)  # (E, num_out)
+        """Map radial basis features to weights, shape ``(E, num_basis) → (E, num_out)``.
+
+        Cast the input to the MLP weight dtype so that this is the single
+        boundary between the (typically double-precision) Bessel basis and
+        the (typically single-precision) learnable network — matching the
+        pattern used by MACE and NequIP.
+        """
+        return self.net(basis.to(self.net[0].weight.dtype))  # (E, num_out)

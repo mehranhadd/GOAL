@@ -1,18 +1,26 @@
-"""Full model architectures — registered for discovery via the model registry."""
+"""Full model architectures.
+
+Drop a new ``.py`` file into this folder with the registration
+decorators on its class (``@MODEL_REGISTRY.register("name")`` and, for
+backbones, also ``@BACKBONE_REGISTRY.register("name")``) and it is
+discovered automatically — no edit to this file required.
+
+The project ships four reference models:
+
+* ``invariant_gnn``     — SchNet-style **invariant** backbone
+                          (educational baseline).
+* ``hyperspec``         — Native equivariant **modular** backbone using
+                          e3nn primitives (educational baseline).
+* ``monolithic_example``— Minimal **monolithic** model returning the
+                          property dict directly (educational baseline).
+* ``kronos`` / ``kronos_monolithic`` — The **native** KRONOS model
+                          (K-order Routed Orthogonal Network of Symmetry
+                          with Element-Pair Mixture-of-Experts).  See
+                          :mod:`goal.ml.nn.models.kronos`.
+"""
 
 from __future__ import annotations
 
-from goal.ml.registry import MODEL_REGISTRY
+from goal.ml.registry import auto_discover
 
-MODEL_REGISTRY.register_lazy("hyperspec", "goal.ml.nn.models.hyperspec:HyperSpecModel")
-MODEL_REGISTRY.register_lazy("invariant_gnn", "goal.ml.nn.models.invariant:InvariantGNN")
-
-# Invariant backbones — edge-based scalar feature extractors
-MODEL_REGISTRY.register_lazy("deepset", "goal.ml.nn.models.deepset:DeepSet")
-MODEL_REGISTRY.register_lazy("hyperset", "goal.ml.nn.models.hyperset:HyperSet")
-MODEL_REGISTRY.register_lazy("lucidset", "goal.ml.nn.models.lucidset:LucidSet")
-
-# Monolithic example — bypasses backbone→head split (head: null)
-MODEL_REGISTRY.register_lazy(
-    "monolithic_example", "goal.ml.nn.models.monolithic_example:MonolithicExample"
-)
+auto_discover(__name__)

@@ -1,0 +1,12 @@
+# @package model.backbone
+# KRONOS element set — H, C, O (no nitrogen).
+# Number of expert modules = K * (K + 1) / 2 = 6
+# (H-H, H-C, H-O, C-C, C-O, O-O).
+#
+# Use this set for HCO-only datasets (alcohols, ethers, carbonyls, etc.)
+# to avoid spending compute on N-containing experts that would always be
+# zero-masked.
+
+elements: [1, 6, 8]
+dressing_kwargs:
+  num_elements: 9

@@ -219,9 +219,14 @@ class EnergyLoss(nn.Module):
         pred: dict[str, torch.Tensor],
         target: dict[str, torch.Tensor],
     ) -> torch.Tensor:
+        # ``num_atoms`` is a property of the input batch, so it is identical
+        # in ``pred`` and ``target``.  The PyG ``Batch`` used as ``target``
+        # doesn't carry it as an indexable key — only the head's output dict
+        # does — so we read it from ``pred`` for both denominators.
+        n_atoms: torch.Tensor = pred["num_atoms"]
         return self.loss_fn(
-            pred["energy"] / pred["num_atoms"],
-            target["energy"] / target["num_atoms"],
+            pred["energy"] / n_atoms,
+            target["energy"] / n_atoms,
         )
 
 

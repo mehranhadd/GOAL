@@ -62,18 +62,25 @@ repos:
         args:
           [
             "--extend-ignore",
-            "E203,E402,E501,F401,F841,RST2,RST301",
+            "E203,E402,E501,F401,F841,RST2,RST301,RST304",
             "--exclude",
             "logs/*,data/*",
           ]
         additional_dependencies: [flake8-rst-docstrings==0.3.0]
 
-  # python security linter
+  # python security linter.  Skipped checks:
+  #   B101 — assert_used (we use asserts in tests by design)
+  #   B108 — hardcoded /tmp path (scratch directories in adapters)
+  #   B110 — try/except/pass (best-effort cleanup in MD observer/runner)
+  #   B301 — pickle.loads (LMDB dataset reader stores pickled data)
+  #   B311 — random not crypto-safe (used in tutorial-generation script)
+  #   B403 — pickle import (paired with B301)
+  #   B614 — unsafe torch.load (loads trusted checkpoints from configured paths)
   - repo: https://github.com/PyCQA/bandit
     rev: "1.8.3"
     hooks:
       - id: bandit
-        args: ["-s", "B101"]
+        args: ["-s", "B101,B108,B110,B301,B311,B403,B614"]
 
   # yaml formatting
   - repo: https://github.com/pre-commit/mirrors-prettier

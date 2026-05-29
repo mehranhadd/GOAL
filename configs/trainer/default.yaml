@@ -2,27 +2,31 @@ _target_: lightning.pytorch.trainer.Trainer
 
 default_root_dir: ${paths.output_dir}
 
-min_epochs: 1 # prevents early stopping
-max_epochs: 10
+min_epochs: 5 # prevents early stopping
+max_epochs: 1000
 
 accelerator: auto
 devices: auto
 
 # Precision: '32', 'bf16-mixed', '16-mixed', '64-true'
-precision: "32"
+precision: "64-true"
 
 # perform a validation loop every N training epochs
 check_val_every_n_epoch: 1
 
 # logging frequency
-log_every_n_steps: 50
+log_every_n_steps: 500
 
 # set True to ensure deterministic results
 # makes training slower but gives more reproducibility than just setting seeds
 deterministic: false
 
-# gradient clipping (0 = disabled, handled by module if preferred)
-gradient_clip_val: 0
+# gradient clipping — null = unconfigured at the Trainer level.  The
+# ``GOALModule.on_before_optimizer_step`` hook handles clipping using
+# ``cfg.training.gradient_clip`` (set in ``configs/training/default.yaml``).
+# Lightning refuses to allow both ``Trainer(gradient_clip_val=...)`` *and*
+# manual ``clip_gradients(...)`` calls, so we leave the Trainer side null.
+gradient_clip_val: null
 gradient_clip_algorithm: "norm"
 
 # gradient accumulation — simulate larger batch sizes
@@ -30,7 +34,7 @@ gradient_clip_algorithm: "norm"
 accumulate_grad_batches: 1
 
 # detect anomalies (useful for debugging NaN/Inf, disable for production)
-detect_anomaly: false
+detect_anomaly: true
 
 # enable model summary (Lightning 2.6 auto-uses RichModelSummary if rich installed)
 enable_model_summary: true

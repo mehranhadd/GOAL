@@ -1,0 +1,4 @@
+# MTS Langevin dynamics
+timestep: 1.0
+temperature_K: 300.0
+friction: 0.5

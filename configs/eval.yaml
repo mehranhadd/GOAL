@@ -3,7 +3,7 @@
 defaults:
   - _self_
   - data: xyz
-  - model: hyperspec
+  - model: kronos
   - training: default
   - callbacks: default
   - logger: null
