@@ -16,6 +16,7 @@ from omegaconf import DictConfig
 
 from goal.ml.cli import CONFIGS_DIR
 from goal.ml.data.datamodule import GOALDataModule
+from goal.ml.nn.models.base import MonolithicModel
 from goal.ml.registry import BACKBONE_REGISTRY, HEAD_REGISTRY, LOSS_REGISTRY
 from goal.ml.training.loss import CompositeLoss, WeightedLoss
 from goal.ml.training.module import GOALModule
@@ -44,19 +45,57 @@ def _instantiate_loggers(cfg: DictConfig | None) -> list[Logger]:
 
 
 def _build_loss(cfg: DictConfig) -> CompositeLoss:
-    """Construct the composite loss from config."""
+    """Construct the composite loss from config.
+
+    Mirrors ``train.py``'s ``_build_loss`` so loss labels and fn specs
+    are consistent between training and evaluation.
+    """
     losses: list[WeightedLoss] = []
     for loss_cfg in cfg.training.losses:
         loss_cls: typing.Any = LOSS_REGISTRY.get(loss_cfg.name)
-        weighted: WeightedLoss = WeightedLoss(loss_cls(), weight=loss_cfg.weight)
-        losses.append(weighted)
+        fn_spec: typing.Any = loss_cfg.get("fn", "mse")
+        loss_kwargs: dict[str, typing.Any] = {
+            k: v for k, v in loss_cfg.items() if k not in ("name", "weight", "fn")
+        }
+        if isinstance(fn_spec, str):
+            losses.append(
+                WeightedLoss(
+                    loss_cls(loss_fn=fn_spec, **loss_kwargs),
+                    weight=loss_cfg.weight,
+                    label=loss_cfg.name,
+                )
+            )
+        else:
+            for sub in fn_spec:
+                sub_name: str = sub["name"] if isinstance(sub, dict) else sub.name
+                sub_weight: float = float(sub["weight"] if isinstance(sub, dict) else sub.weight)
+                fn_label: str = sub_name.rsplit(".", 1)[-1]
+                losses.append(
+                    WeightedLoss(
+                        loss_cls(loss_fn=sub_name),
+                        weight=sub_weight,
+                        label=f"{loss_cfg.name}_{fn_label}",
+                        group=loss_cfg.name,
+                    )
+                )
     return CompositeLoss(losses)
 
 
-def _build_head(cfg: DictConfig) -> typing.Any:
-    """Build the task head from config."""
-    head_cls: typing.Any = HEAD_REGISTRY.get(cfg.model.head.name)
-    head_kwargs: dict[str, typing.Any] = {k: v for k, v in cfg.model.head.items() if k != "name"}
+def _build_head(cfg: DictConfig, backbone: typing.Any) -> typing.Any:
+    """Build the task head from config, or ``None`` for monolithic backbones."""
+    head_cfg = cfg.model.get("head", None)
+    is_monolithic: bool = isinstance(backbone, MonolithicModel)
+
+    if is_monolithic:
+        return None
+
+    if head_cfg is None:
+        raise ValueError(
+            f"Backbone '{cfg.model.backbone.name}' requires a 'head:' block in the model config."
+        )
+
+    head_cls: typing.Any = HEAD_REGISTRY.get(head_cfg.name)
+    head_kwargs: dict[str, typing.Any] = {k: v for k, v in head_cfg.items() if k != "name"}
     return head_cls(**head_kwargs)
 
 
@@ -86,7 +125,7 @@ def evaluate(cfg: DictConfig) -> None:
     }
     backbone: typing.Any = backbone_cls(**backbone_kwargs)
 
-    head: typing.Any = _build_head(cfg)
+    head: typing.Any = _build_head(cfg, backbone)
     loss: CompositeLoss = _build_loss(cfg)
 
     module: GOALModule = GOALModule(backbone=backbone, head=head, loss=loss, config=cfg)
@@ -96,7 +135,6 @@ def evaluate(cfg: DictConfig) -> None:
     callbacks: list[Callback] = _instantiate_callbacks(cfg.get("callbacks"))
     loggers: list[Logger] = _instantiate_loggers(cfg.get("logger"))
 
-    # Trainer from config group — strategy is determined by trainer yaml
     trainer: typing.Any = hydra.utils.instantiate(
         cfg.trainer,
         callbacks=callbacks or None,

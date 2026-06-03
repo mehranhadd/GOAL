@@ -16,7 +16,7 @@ from torch_geometric.data import Data
 
 
 def _make_fake_md17_data(n: int = 100) -> list[Data]:
-    """Create fake MD17-like Data objects."""
+    """Create fake MD17-like Data objects (legacy, kept for reference)."""
     items: list[Data] = []
     for _ in range(n):
         num_atoms = 21  # aspirin
@@ -28,6 +28,28 @@ def _make_fake_md17_data(n: int = 100) -> list[Data]:
         )
         items.append(data)
     return items
+
+
+def _make_fake_atomic_graphs(n: int = 100) -> list:
+    """Create fake AtomicGraph objects with energies already in eV range."""
+    from goal.ml.data.graph import AtomicGraph
+
+    num_atoms = 21  # aspirin
+    graphs = []
+    for _ in range(n):
+        pos = torch.randn(num_atoms, 3, dtype=torch.float64)
+        graphs.append(
+            AtomicGraph(
+                positions=pos,
+                atomic_numbers=torch.randint(1, 9, (num_atoms,)),
+                cell=torch.zeros(3, 3, dtype=torch.float64),
+                pbc=torch.zeros(3, dtype=torch.bool),
+                edge_index=torch.zeros(2, 0, dtype=torch.long),
+                energy=torch.tensor([-13.0 + 0.1 * torch.randn(1).item()], dtype=torch.float64),
+                forces=torch.randn(num_atoms, 3, dtype=torch.float64),
+            )
+        )
+    return graphs
 
 
 def _make_fake_ani1_data(n: int = 50) -> list[Data]:
@@ -124,11 +146,12 @@ class TestMD17Dataset:
 
     @pytest.fixture()
     def mock_pyg_md17(self):
-        """Patch PyG's MD17 dataset to return fake data."""
-        fake_data = _make_fake_md17_data(100)
-        with patch("examples.datasets.md17.PyGMD17") as mock_cls:
-            mock_cls.return_value = fake_data
-            yield mock_cls
+        """Patch MD17Dataset._download_and_process to avoid network calls."""
+        from examples.datasets.md17 import MD17Dataset
+
+        fake_graphs = _make_fake_atomic_graphs(100)
+        with patch.object(MD17Dataset, "_download_and_process", return_value=fake_graphs) as mock:
+            yield mock
 
     def test_creates_cache_on_first_call(self, tmp_path: Path, mock_pyg_md17):
         """First call should create a .pt cache file."""

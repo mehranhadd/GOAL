@@ -153,12 +153,13 @@ class KronosMonolithic(nn.Module):
         edge_lengths: torch.Tensor
         edge_vectors, edge_lengths = differentiable_edges(graph, positions)
 
-        dressed: torch.Tensor = self.dressing(
+        dressed: torch.Tensor
+        dressed, _layer_e = self.dressing(
             atomic_numbers=graph.atomic_numbers,
             edge_index=graph.edge_index,
             edge_vectors=edge_vectors,
             edge_lengths=edge_lengths,
-        )  # (N, irreps_out.dim)
+        )  # (N, irreps_out.dim), layer_energies ignored in monolithic path
 
         node_energies: torch.Tensor = self.moe(
             atom_features=dressed,

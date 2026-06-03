@@ -134,6 +134,11 @@ class ExpertConfig:
         Multi-head attention heads when ``expert_type == "transformer"``.
     transformer_layers : int
         Number of transformer encoder layers.
+    dropout_rate : float
+        Dropout probability inserted between every ``Linear`` layer in
+        the ``"linear"`` backbone MLP.  ``0.0`` disables dropout (default).
+        ``nn.Dropout`` is used so dropout is automatically disabled during
+        ``model.eval()`` / validation and inference.
     """
 
     scalar_channels: int = 16
@@ -141,15 +146,19 @@ class ExpertConfig:
     expert_type: str = "linear"
     transformer_heads: int = 2
     transformer_layers: int = 1
+    dropout_rate: float = 0.0
+    # Rare-pair expert (CHANGE 4)
+    rare_pair_embed_dim: int = 16
 
 
 class _LinearExpert(nn.Module):
-    """Standard MLP expert ``[in] → SiLU → ... → 1``."""
+    """Standard MLP expert ``[in] → SiLU → [Dropout] → ... → 1``."""
 
     def __init__(
         self,
         in_dim: int,
         hidden_dims: typing.Sequence[int],
+        dropout_rate: float = 0.0,
     ) -> None:
         super().__init__()
         layers: list[nn.Module] = []
@@ -157,6 +166,8 @@ class _LinearExpert(nn.Module):
         for h in hidden_dims:
             layers.append(nn.Linear(prev, h))
             layers.append(nn.SiLU())
+            if dropout_rate > 0.0:
+                layers.append(nn.Dropout(p=dropout_rate))
             prev = h
         layers.append(nn.Linear(prev, 1))
         self.net: nn.Sequential = nn.Sequential(*layers)
@@ -271,6 +282,7 @@ class PairwiseExpert(nn.Module):
             self.backbone: nn.Module = _LinearExpert(
                 in_dim=in_dim,
                 hidden_dims=config.hidden_dims,
+                dropout_rate=config.dropout_rate,
             )
         elif config.expert_type == "transformer":
             self._backbone_type = "transformer"
@@ -320,6 +332,159 @@ class PairwiseExpert(nn.Module):
             raw = self.backbone((scalars_a, scalars_b, distances.unsqueeze(-1)))  # (P,)
         return self.gate * raw
 
+    def forward_pairwise(
+        self,
+        scalars_a: torch.Tensor,
+        scalars_b: torch.Tensor,
+        edge_vectors: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute ``(E_ij, F_ij)`` for the pairwise force mode.
+
+        ``F_ij = -∂E_ij/∂r_ij`` is taken via ``torch.autograd.grad`` so
+        Newton's third law is satisfied per directed edge when the
+        caller scatters ``F_ij`` to source and ``-F_ij`` to destination
+        atoms.
+
+        Parameters
+        ----------
+        scalars_a, scalars_b : Tensor
+            Invariant scalars of source / destination atom, shape
+            ``(P, scalar_channels)``.
+        edge_vectors : Tensor
+            Per-edge displacement vectors ``r_ij = pos[j] - pos[i]``
+            of shape ``(P, 3)``.  Treated as the leaf of the local
+            autograd graph — its ``requires_grad`` is enabled inside
+            this method without affecting the caller's tensor.
+
+        Returns
+        -------
+        tuple of Tensor
+            ``(E_ij, F_ij)`` with shapes ``(P,)`` and ``(P, 3)``.
+        """
+        # Use a local leaf so the gradient stops at edge_vectors (we
+        # only want the per-pair derivative, not a derivative back
+        # through positions — the head can still take a separate
+        # autograd path on ``graph.pos`` if it wants combined mode).
+        r_ij: torch.Tensor = edge_vectors.detach().requires_grad_(True)
+        distances: torch.Tensor = r_ij.norm(dim=-1)  # (P,)
+
+        if self._backbone_type == "linear":
+            pair_features: torch.Tensor = torch.cat(
+                [scalars_a, scalars_b, distances.unsqueeze(-1)], dim=-1
+            )
+            raw: torch.Tensor = self.backbone(pair_features)  # (P,)
+        else:  # transformer
+            raw = self.backbone((scalars_a, scalars_b, distances.unsqueeze(-1)))  # (P,)
+        e_ij: torch.Tensor = self.gate * raw  # (P,)
+
+        # F_ij = -dE_ij/dr_ij
+        grad_outputs: tuple[torch.Tensor, ...] = torch.autograd.grad(
+            outputs=e_ij.sum(),
+            inputs=r_ij,
+            create_graph=self.training,
+            retain_graph=True,
+        )
+        f_ij: torch.Tensor = -grad_outputs[0]  # (P, 3)
+        return e_ij, f_ij
+
+
+# ---------------------------------------------------------------------------
+# Rare-pair expert (CHANGE 4)
+# ---------------------------------------------------------------------------
+
+
+class RarePairExpert(nn.Module):
+    """Shared expert for rare/infrequent element pairs.
+
+    Unlike :class:`PairwiseExpert` — which dedicates one full MLP per pair —
+    this module handles *all* rare pairs in a single network by injecting a
+    per-pair learned embedding.  Each rare pair gets its own
+    ``pair_embed_dim``-dimensional embedding vector and its own scalar gate,
+    so the network can still specialize per pair.
+
+    The ``n_rare`` learned gate parameters and embedding rows remain in the
+    autograd graph regardless of whether the corresponding pair appears in
+    the current batch (same zero-masking contract as :class:`KronosMoE`).
+
+    Parameters
+    ----------
+    irreps_in : Irreps
+        Irreps of the atom features fed into this expert.
+    pairs : list of (int, int)
+        The rare unordered element pairs this expert handles, in canonical
+        ``(lo, hi)`` order.
+    config : ExpertConfig
+        Shared expert config; ``rare_pair_embed_dim`` controls the embedding width.
+    """
+
+    def __init__(
+        self,
+        irreps_in: Irreps,
+        pairs: list[tuple[int, int]],
+        config: ExpertConfig,
+    ) -> None:
+        super().__init__()
+        if not pairs:
+            raise ValueError("RarePairExpert requires at least one pair.")
+        self._pairs: tuple[tuple[int, int], ...] = tuple(pairs)
+        self.scalar_channels: int = config.scalar_channels
+        self._embed_dim: int = config.rare_pair_embed_dim
+
+        scalar_irreps: Irreps = Irreps(f"{config.scalar_channels}x0e")
+        self.scalar_proj: EquivariantLinear = EquivariantLinear(irreps_in, scalar_irreps)
+
+        # Per-pair embedding and gates
+        n: int = len(pairs)
+        self.pair_embed: nn.Embedding = nn.Embedding(n, config.rare_pair_embed_dim)
+        self.gates: nn.Parameter = nn.Parameter(torch.ones(n))
+
+        # Shared MLP: [s_A, s_B, pair_embed, dist] → 1
+        in_dim: int = 2 * config.scalar_channels + config.rare_pair_embed_dim + 1
+        self.backbone: _LinearExpert = _LinearExpert(
+            in_dim=in_dim,
+            hidden_dims=config.hidden_dims,
+            dropout_rate=config.dropout_rate,
+        )
+
+    def project(self, atom_features: torch.Tensor) -> torch.Tensor:
+        """Invariant projection ``(N, irreps_in.dim) → (N, scalar_channels)``."""
+        return self.scalar_proj(atom_features)
+
+    def forward(
+        self,
+        scalars_a: torch.Tensor,
+        scalars_b: torch.Tensor,
+        distances: torch.Tensor,
+        pair_local_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute gated pair energies for a batch of edges (same rare pair type).
+
+        Parameters
+        ----------
+        scalars_a, scalars_b : Tensor ``(E, scalar_channels)``
+            Masked atom scalars for source / destination.
+        distances : Tensor ``(E,)``
+            Masked pair distances.
+        pair_local_idx : Tensor ``(E,)`` int
+            Local index into this expert's pair list (same value for all
+            edges of the same rare pair type; varies when batching multiple
+            rare pairs, but caller loops over pairs separately).
+
+        Returns
+        -------
+        Tensor ``(E,)``
+            Gated per-pair energy contributions.
+        """
+        embed: torch.Tensor = self.pair_embed(
+            pair_local_idx.clamp(0, len(self._pairs) - 1)
+        )  # (E, embed_dim)
+        feats: torch.Tensor = torch.cat(
+            [scalars_a, scalars_b, embed, distances.unsqueeze(-1)], dim=-1
+        )  # (E, 2*S + D + 1)
+        raw: torch.Tensor = self.backbone(feats)  # (E,)
+        gate: torch.Tensor = self.gates[pair_local_idx]  # (E,)
+        return gate * raw
+
 
 # ---------------------------------------------------------------------------
 # MoE container
@@ -327,35 +492,46 @@ class PairwiseExpert(nn.Module):
 
 
 class KronosMoE(nn.Module):
-    """KRONOS Element-Pair Mixture-of-Experts.
+    """KRONOS Element-Pair Mixture-of-Experts with optional data-driven routing.
 
-    Instantiates exactly one ``PairwiseExpert`` per unordered element
-    pair derived from the ``elements`` list.
+    By default, instantiates one :class:`PairwiseExpert` per unordered element
+    pair (original behaviour, ``rare_pair_enabled=False``).
+
+    When ``rare_pair_enabled=True`` and ``pair_counts`` is provided, pairs whose
+    frequency (fraction of total edges) falls below ``min_pair_frequency`` are
+    routed to a single shared :class:`RarePairExpert` that uses a learned
+    pair-type embedding to distinguish them.  Common pairs still get their own
+    dedicated :class:`PairwiseExpert`.  A routing summary is logged at init.
 
     Parameters
     ----------
     elements : sequence of int
-        Atomic numbers covered by the model.  For example
-        ``(1, 6, 7, 8)`` gives 10 unique unordered pairs:
-        ``H-H, H-C, H-N, H-O, C-C, C-N, C-O, N-N, N-O, O-O``.
+        Atomic numbers covered by the model.
     irreps_in : Irreps or str
         Irreps of the per-atom features fed into the MoE.
     expert_config : ExpertConfig
-        Static configuration for every expert (shared across pairs).
+        Config shared by all expert modules.
     cutoff : float
         Cosine-cutoff radius (Angstrom) applied to each pair energy.
+    pair_counts : dict, optional
+        ``{(Z_A, Z_B): edge_count}`` over the training set.  Required for
+        data-driven routing (used when ``rare_pair_enabled=True``).
+    rare_pair_enabled : bool
+        When ``True`` and ``pair_counts`` is provided, apply frequency-based
+        routing.  Pairs below ``min_pair_frequency`` go to
+        :class:`RarePairExpert`.
+    min_pair_frequency : float
+        Minimum fraction of total edges for a pair to get a dedicated expert.
+        Pairs below this threshold are handled by :class:`RarePairExpert`.
     pair_symbols : optional mapping
-        Optional override for the pretty pair labels (default uses
-        H/C/N/O/...).  Purely cosmetic.
+        Optional override for the pretty pair labels.  Purely cosmetic.
 
     Notes
     -----
     The block emits **per-atom** scalar energies.  Neighbour lists are
     bidirectional (both ``(i, j)`` and ``(j, i)`` edges are present),
     so the standard MLIP convention is followed: a directed edge
-    ``(i, j)`` contributes ``E_pair / 2`` to atom ``i`` only.  Summing
-    over all directed edges then recovers each undirected pair energy
-    exactly once.
+    ``(i, j)`` contributes ``E_pair / 2`` to atom ``i`` only.
     """
 
     def __init__(
@@ -364,6 +540,9 @@ class KronosMoE(nn.Module):
         irreps_in: Irreps | str,
         expert_config: ExpertConfig,
         cutoff: float = 5.0,
+        pair_counts: typing.Mapping[tuple[int, int], int] | None = None,
+        rare_pair_enabled: bool = False,
+        min_pair_frequency: float = 0.01,
         pair_symbols: typing.Mapping[int, str] | None = None,
     ) -> None:
         super().__init__()
@@ -373,33 +552,49 @@ class KronosMoE(nn.Module):
         self._irreps_in: Irreps = Irreps(irreps_in)
         self._cutoff: float = cutoff
         self._symbols: typing.Mapping[int, str] = pair_symbols or _DEFAULT_SYMBOLS
+        self._rare_pair_enabled: bool = bool(rare_pair_enabled)
 
-        # Enumerate pairs deterministically
+        # Enumerate all pairs deterministically
         pairs: list[tuple[int, int]] = enumerate_element_pairs(self._elements)
         self._pairs: tuple[tuple[int, int], ...] = tuple(pairs)
 
-        # Map pair → expert index (ModuleDict keyed by safe string name)
+        # Data-driven routing (CHANGE 4)
+        dedicated_pairs: list[tuple[int, int]] = []
+        rare_pairs: list[tuple[int, int]] = []
+
+        if rare_pair_enabled and pair_counts is not None:
+            total_edges: int = max(1, sum(pair_counts.values()))
+            for p in pairs:
+                cnt: int = int(pair_counts.get(p, pair_counts.get((p[1], p[0]), 0)))
+                freq: float = cnt / total_edges
+                if freq >= min_pair_frequency:
+                    dedicated_pairs.append(p)
+                else:
+                    rare_pairs.append(p)
+        else:
+            dedicated_pairs = list(pairs)
+
+        self._dedicated_pairs: tuple[tuple[int, int], ...] = tuple(dedicated_pairs)
+        self._rare_pairs: tuple[tuple[int, int], ...] = tuple(rare_pairs)
+
+        # Build dedicated experts
         experts: dict[str, PairwiseExpert] = {}
         self._pair_keys: list[str] = []
-        for a, b in self._pairs:
+        for a, b in self._dedicated_pairs:
             key: str = self._key(a, b)
             self._pair_keys.append(key)
             experts[key] = PairwiseExpert(self._irreps_in, expert_config)
         self.experts: nn.ModuleDict = nn.ModuleDict(experts)
 
-        # Learnable per-element atomic-energy reference.  Added to every
-        # atom's energy *outside* the cosine-cutoff envelope so the model
-        # can represent the large constant per-Z offset present in raw
-        # DFT labels (cf. MACE's AtomicEnergiesBlock, NequIP's
-        # PerSpeciesShift).  Without this term every per-atom
-        # contribution decays to zero at the cutoff and the loss
-        # plateaus at the dataset's |E_target/n_atoms|.
-        self.atomic_shift: nn.Parameter = nn.Parameter(torch.zeros(len(self._elements)))
-        max_z: int = max(self._elements)
-        z_to_idx: torch.Tensor = torch.full((max_z + 1,), -1, dtype=torch.long)
-        for idx, z in enumerate(self._elements):
-            z_to_idx[z] = idx
-        self.register_buffer("_z_to_idx", z_to_idx, persistent=False)
+        # Build shared rare-pair expert (None when no rare pairs)
+        self.rare_expert: RarePairExpert | None = (
+            RarePairExpert(self._irreps_in, list(rare_pairs), expert_config)
+            if rare_pairs
+            else None
+        )
+
+        # Log routing table at construction time
+        self._log_routing_table(pair_counts, min_pair_frequency)
 
     # ------------------------------------------------------------------
     # Naming helpers
@@ -407,12 +602,97 @@ class KronosMoE(nn.Module):
 
     @staticmethod
     def _key(a: int, b: int) -> str:
-        """Deterministic, ModuleDict-safe key for an unordered pair."""
         lo, hi = sorted((a, b))
         return f"z{lo}_z{hi}"
 
     def pair_label(self, a: int, b: int) -> str:
         return pair_label(a, b, self._symbols)
+
+    # ------------------------------------------------------------------
+    # Routing-table logger
+    # ------------------------------------------------------------------
+
+    def _log_routing_table(
+        self,
+        pair_counts: typing.Mapping[tuple[int, int], int] | None,
+        min_pair_frequency: float,
+    ) -> None:
+        """Print expert routing summary using rich (falls back to plain text)."""
+        from lightning.pytorch.utilities.rank_zero import rank_zero_info
+
+        total_edges: int = max(1, sum(pair_counts.values())) if pair_counts is not None else 0
+        rare_labels: list[str] = [self.pair_label(a, b) for a, b in self._rare_pairs]
+
+        try:
+            from rich.console import Console
+            from rich.table import Table
+
+            console = Console()
+            table = Table(
+                title="[bold cyan]KRONOS Expert Routing[/bold cyan]",
+                show_header=True,
+                header_style="bold magenta",
+            )
+            table.add_column("Pair", style="cyan", no_wrap=True)
+            table.add_column("Count", justify="right")
+            table.add_column("Frequency", justify="right")
+            table.add_column("Routing", justify="left")
+
+            for a, b in self._pairs:
+                lbl = self.pair_label(a, b)
+                cnt: int = 0
+                freq_str: str = "n/a"
+                if pair_counts is not None:
+                    cnt = int(pair_counts.get((a, b), pair_counts.get((b, a), 0)))
+                    freq = cnt / total_edges
+                    freq_str = f"{freq*100:.2f}%"
+
+                is_rare = (a, b) in self._rare_pairs
+                if is_rare:
+                    routing = f"[yellow]→ RarePairExpert[/yellow]"
+                else:
+                    routing = "[green]PairwiseExpert (dedicated)[/green]"
+                table.add_row(lbl, str(cnt), freq_str, routing)
+
+            import io
+
+            buf = io.StringIO()
+            Console(file=buf, no_color=True, width=90).print(table)
+            rank_zero_info("\n" + buf.getvalue())
+
+        except ImportError:
+            # Plain-text fallback
+            lines: list[str] = ["KRONOS Expert Routing:"]
+            lines.append(f"  {'Pair':<10} {'Count':>8} {'Freq':>8}  Routing")
+            lines.append("  " + "-" * 50)
+            for a, b in self._pairs:
+                lbl = self.pair_label(a, b)
+                cnt = 0
+                freq_str = "n/a"
+                if pair_counts is not None:
+                    cnt = int(pair_counts.get((a, b), pair_counts.get((b, a), 0)))
+                    freq = cnt / total_edges
+                    freq_str = f"{freq*100:.2f}%"
+                is_rare = (a, b) in self._rare_pairs
+                routing = "→ RarePairExpert" if is_rare else "PairwiseExpert (dedicated)"
+                lines.append(f"  {lbl:<10} {cnt:>8} {freq_str:>8}  {routing}")
+            lines.append("")
+            rank_zero_info("\n".join(lines))
+
+        # Summary line
+        n_dedicated = len(self._dedicated_pairs)
+        n_rare = len(self._rare_pairs)
+        if n_rare > 0:
+            rank_zero_info(
+                f"[KRONOS MoE] {n_dedicated} dedicated PairwiseExperts | "
+                f"{n_rare} rare pair(s) handled by RarePairExpert: "
+                f"{', '.join(rare_labels)}"
+            )
+        else:
+            rank_zero_info(
+                f"[KRONOS MoE] {n_dedicated} dedicated PairwiseExperts "
+                f"(no rare-pair routing active)"
+            )
 
     # ------------------------------------------------------------------
     # Introspection
@@ -424,7 +704,8 @@ class KronosMoE(nn.Module):
 
     @property
     def num_experts(self) -> int:
-        return len(self._pairs)
+        """Total number of expert modules (dedicated + 1 shared if rare pairs exist)."""
+        return len(self._dedicated_pairs) + (1 if self.rare_expert is not None else 0)
 
     @property
     def pairs(self) -> tuple[tuple[int, int], ...]:
@@ -436,10 +717,81 @@ class KronosMoE(nn.Module):
 
     def gates(self) -> dict[str, torch.Tensor]:
         """Return a dict ``{pair_label: gate_value}`` for logging."""
-        return {
+        result: dict[str, torch.Tensor] = {
             self.pair_label(a, b): self.experts[self._key(a, b)].gate.detach()
-            for a, b in self._pairs
+            for a, b in self._dedicated_pairs
         }
+        if self.rare_expert is not None:
+            for local_idx, (a, b) in enumerate(self._rare_pairs):
+                result[self.pair_label(a, b)] = self.rare_expert.gates[local_idx].detach()
+        return result
+
+    @torch.no_grad()
+    def compute_expert_loads(
+        self,
+        atom_features: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_lengths: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Compute mean absolute energy contribution per expert over a batch.
+
+        For each expert ``E_{AB}``:
+            ``load_AB = mean(|P_AB * E_AB_output(masked_inputs)|)``
+
+        averaged over all edges in the batch (masked edges contribute 0 and
+        are included in the denominator, consistent with the forward pass).
+
+        Returns
+        -------
+        dict
+            ``{pair_label: scalar_tensor}`` of per-expert loads (detached).
+            Also includes ``"load_variance"`` — the coefficient of variation
+            ``std(loads) / mean(loads)`` across all experts.  A value > 2.0
+            indicates expert collapse.  When E == 0 all loads are 0 and
+            ``load_variance`` is 0.
+        """
+        dtype: torch.dtype = atom_features.dtype
+        device: torch.device = atom_features.device
+        E: int = int(edge_lengths.shape[0])
+
+        result: dict[str, torch.Tensor] = {}
+
+        if E == 0:
+            for a, b in self._pairs:
+                result[self.pair_label(a, b)] = torch.zeros((), device=device, dtype=dtype)
+            result["load_variance"] = torch.zeros((), device=device, dtype=dtype)
+            return result
+
+        edge_lengths_dt = edge_lengths.to(dtype)
+        cut_env: torch.Tensor = cosine_cutoff(edge_lengths_dt, self._cutoff)
+        row, col = edge_index
+        z_row: torch.Tensor = atomic_numbers[row]
+        z_col: torch.Tensor = atomic_numbers[col]
+        z_lo: torch.Tensor = torch.minimum(z_row, z_col)
+        z_hi: torch.Tensor = torch.maximum(z_row, z_col)
+
+        load_values: list[torch.Tensor] = []
+        for (a, b), key in zip(self._pairs, self._pair_keys):
+            expert = typing.cast(PairwiseExpert, self.experts[key])
+            mask: torch.Tensor = ((z_lo == a) & (z_hi == b)).to(dtype)
+            mask_col = mask.unsqueeze(-1)
+
+            scalars: torch.Tensor = expert.project(atom_features)
+            scalars_a: torch.Tensor = scalars[row] * mask_col
+            scalars_b: torch.Tensor = scalars[col] * mask_col
+            dist_in: torch.Tensor = edge_lengths_dt * mask
+
+            pair_e: torch.Tensor = expert(scalars_a, scalars_b, dist_in)
+            tapered: torch.Tensor = pair_e * mask * cut_env
+            load: torch.Tensor = tapered.abs().mean()
+            result[self.pair_label(a, b)] = load
+            load_values.append(load)
+
+        loads_t: torch.Tensor = torch.stack(load_values)
+        mean_load: torch.Tensor = loads_t.mean().clamp_min(1e-12)
+        result["load_variance"] = loads_t.std() / mean_load
+        return result
 
     # ------------------------------------------------------------------
     # Forward
@@ -501,81 +853,196 @@ class KronosMoE(nn.Module):
         # Same MACE / NequIP pattern as ``radial.RadialMLP`` / interaction.
         edge_lengths = edge_lengths.to(dtype)
 
-        # Accumulator for per-atom energies, seeded with the learnable
-        # per-element shift (the only path that can express a non-zero
-        # constant per-atom energy — every pair contribution downstream
-        # is multiplied by ``cos_env(d)`` and therefore vanishes at the
-        # cutoff).  Out-of-vocab atomic numbers (Z not in ``elements``)
-        # map to ``-1`` in ``_z_to_idx`` and contribute zero shift.
-        z_idx: torch.Tensor = self._z_to_idx[atomic_numbers]  # (N,)
-        in_vocab: torch.Tensor = z_idx >= 0  # (N,)
-        gathered: torch.Tensor = self.atomic_shift[z_idx.clamp(min=0)]  # (N,)
-        shift_per_atom: torch.Tensor = (gathered * in_vocab.to(gathered.dtype)).to(
-            device=device, dtype=dtype
-        )
-        atom_energies: torch.Tensor = shift_per_atom
+        # Accumulator for per-atom interaction energy.  The per-element
+        # baseline lives on the ``KronosBackbone`` as a fixed buffer
+        # (``atomic_energies``, computed from data via least-squares
+        # regression) and is added there — the MoE only models the
+        # local interaction residual.
+        atom_energies: torch.Tensor = torch.zeros(num_atoms, device=device, dtype=dtype)
         per_pair_total: dict[str, torch.Tensor] = {}
 
         # ----- Degenerate case: no edges at all -----
         if E == 0:
-            first_key: str = self._pair_keys[0]
-            scalar_channels: int = self.experts[first_key].scalar_channels
+            # Keep every expert in the autograd graph via a zero-contribution dummy.
+            first_key: str = self._pair_keys[0] if self._pair_keys else ""
+            scalar_channels: int = (
+                self.experts[first_key].scalar_channels
+                if first_key
+                else (self.rare_expert.scalar_channels if self.rare_expert else 1)
+            )
             dummy_scalars: torch.Tensor = torch.zeros(
                 1, scalar_channels, device=device, dtype=dtype
             )
             dummy_dist: torch.Tensor = torch.zeros(1, device=device, dtype=dtype)
-            for (a, b), key in zip(self._pairs, self._pair_keys):
+            for (a, b), key in zip(self._dedicated_pairs, self._pair_keys):
                 expert = typing.cast(PairwiseExpert, self.experts[key])
-                _ = expert.project(atom_features)  # keep proj in the graph
+                _ = expert.project(atom_features)
                 dummy_out: torch.Tensor = expert(dummy_scalars, dummy_scalars, dummy_dist)
                 atom_energies = atom_energies + 0.0 * dummy_out.sum()
                 if return_per_pair:
                     per_pair_total[self.pair_label(a, b)] = torch.zeros(
                         (), device=device, dtype=dtype
                     )
+            if self.rare_expert is not None:
+                _ = self.rare_expert.project(atom_features)
+                dummy_idx: torch.Tensor = torch.zeros(1, dtype=torch.long, device=device)
+                dummy_re: torch.Tensor = self.rare_expert(
+                    dummy_scalars, dummy_scalars, dummy_dist, dummy_idx
+                )
+                atom_energies = atom_energies + 0.0 * dummy_re.sum()
+                for a, b in self._rare_pairs:
+                    if return_per_pair:
+                        per_pair_total[self.pair_label(a, b)] = torch.zeros(
+                            (), device=device, dtype=dtype
+                        )
             return (atom_energies, per_pair_total) if return_per_pair else atom_energies
 
         # ----- Normal case: E > 0 -----
-        cut_env: torch.Tensor = cosine_cutoff(edge_lengths, self._cutoff).to(dtype)  # (E,)
+        cut_env: torch.Tensor = cosine_cutoff(edge_lengths, self._cutoff).to(dtype)
 
-        # Edge types (unordered): identify the pair by (min, max) atomic Z.
-        z_row: torch.Tensor = atomic_numbers[row]  # (E,)
-        z_col: torch.Tensor = atomic_numbers[col]  # (E,)
-        z_lo: torch.Tensor = torch.minimum(z_row, z_col)  # (E,)
-        z_hi: torch.Tensor = torch.maximum(z_row, z_col)  # (E,)
+        z_row: torch.Tensor = atomic_numbers[row]
+        z_col: torch.Tensor = atomic_numbers[col]
+        z_lo: torch.Tensor = torch.minimum(z_row, z_col)
+        z_hi: torch.Tensor = torch.maximum(z_row, z_col)
 
-        for (a, b), key in zip(self._pairs, self._pair_keys):
+        # ---- Dedicated pair loop ----
+        for (a, b), key in zip(self._dedicated_pairs, self._pair_keys):
             expert = typing.cast(PairwiseExpert, self.experts[key])
-
-            # Per-edge float mask: 1.0 for matching pair, 0.0 otherwise.
-            mask: torch.Tensor = ((z_lo == a) & (z_hi == b)).to(dtype)  # (E,)
-            mask_col: torch.Tensor = mask.unsqueeze(-1)  # (E, 1) for broadcasting
-
-            # Project EVERY atom's features to scalars — same for all experts'
-            # input lookup; the scalar projection itself is per-expert.
-            scalars: torch.Tensor = expert.project(atom_features)  # (N, S)
-
-            # Apply input mask BEFORE the forward — never an ``if/else`` that
-            # skips the expert.
-            scalars_a: torch.Tensor = scalars[row] * mask_col  # (E, S)
-            scalars_b: torch.Tensor = scalars[col] * mask_col  # (E, S)
-            dist_in: torch.Tensor = edge_lengths * mask  # (E,)
-
-            # Run expert on all E edges — static shape, no branching.
-            pair_e: torch.Tensor = expert(scalars_a, scalars_b, dist_in)  # (E,)
-
-            # Apply output mask so non-matching edges contribute EXACTLY 0.
-            tapered: torch.Tensor = pair_e * mask * cut_env  # (E,)
-
-            # Bidirectional edges → half-energy to row endpoint only.
-            half: torch.Tensor = 0.5 * tapered
-            atom_energies = atom_energies.index_add(0, row, half)
-
+            mask: torch.Tensor = ((z_lo == a) & (z_hi == b)).to(dtype)
+            mask_col: torch.Tensor = mask.unsqueeze(-1)
+            scalars: torch.Tensor = expert.project(atom_features)
+            scalars_a: torch.Tensor = scalars[row] * mask_col
+            scalars_b: torch.Tensor = scalars[col] * mask_col
+            dist_in: torch.Tensor = edge_lengths * mask
+            pair_e: torch.Tensor = expert(scalars_a, scalars_b, dist_in)
+            tapered: torch.Tensor = pair_e * mask * cut_env
+            atom_energies = atom_energies.index_add(0, row, 0.5 * tapered)
             if return_per_pair:
-                # Each undirected pair contributes via two directed
-                # edges; each edge adds ``0.5 * tapered`` to one
-                # endpoint, so the pair's total contribution to the
-                # graph energy is ``0.5 * tapered.sum()``.
                 per_pair_total[self.pair_label(a, b)] = 0.5 * tapered.sum().detach()
 
+        # ---- Rare pairs via shared RarePairExpert ----
+        if self.rare_expert is not None:
+            rare_scalars: torch.Tensor = self.rare_expert.project(atom_features)  # (N, S)
+            for local_idx, (a, b) in enumerate(self._rare_pairs):
+                mask = ((z_lo == a) & (z_hi == b)).to(dtype)
+                mask_col = mask.unsqueeze(-1)
+                sa: torch.Tensor = rare_scalars[row] * mask_col
+                sb: torch.Tensor = rare_scalars[col] * mask_col
+                di: torch.Tensor = edge_lengths * mask
+                pidx: torch.Tensor = torch.full((E,), local_idx, dtype=torch.long, device=device)
+                pair_e = self.rare_expert(sa, sb, di, pidx)
+                tapered = pair_e * mask * cut_env
+                atom_energies = atom_energies.index_add(0, row, 0.5 * tapered)
+                if return_per_pair:
+                    per_pair_total[self.pair_label(a, b)] = 0.5 * tapered.sum().detach()
+
         return (atom_energies, per_pair_total) if return_per_pair else atom_energies
+
+    # ------------------------------------------------------------------
+    # Pairwise force mode (TASK 4)
+    # ------------------------------------------------------------------
+
+    def forward_pairwise(
+        self,
+        atom_features: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vectors: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute per-atom energies AND per-atom forces via pairwise mode.
+
+        Each :class:`PairwiseExpert` produces ``(E_ij, F_ij)`` with
+        ``F_ij = -∂E_ij/∂r_ij`` via autograd; the MoE applies the
+        per-pair mask and cosine-cutoff envelope and scatter-sums to
+        atoms with Newton's third law (``+0.5 F`` to row, ``-0.5 F``
+        to col).  The factor of ``0.5`` accounts for the bidirectional
+        edge convention — each undirected pair appears twice as a
+        directed edge.
+
+        Returns
+        -------
+        tuple of Tensor
+            ``(atom_energies, atom_forces)`` with shapes ``(N,)`` and
+            ``(N, 3)``.  Newton's third law: ``sum_i F_i ≡ 0`` per
+            molecule by construction.
+        """
+        num_atoms: int = atom_features.shape[0]
+        device: torch.device = atom_features.device
+        dtype: torch.dtype = atom_features.dtype
+
+        row, col = edge_index
+        E: int = int(edge_vectors.shape[0])
+
+        atom_energies: torch.Tensor = torch.zeros(num_atoms, device=device, dtype=dtype)
+        atom_forces: torch.Tensor = torch.zeros((num_atoms, 3), device=device, dtype=dtype)
+
+        # Degenerate case: keep all experts in the autograd graph.
+        if E == 0:
+            first_key: str = self._pair_keys[0] if self._pair_keys else ""
+            scalar_channels: int = (
+                self.experts[first_key].scalar_channels
+                if first_key
+                else (self.rare_expert.scalar_channels if self.rare_expert else 1)
+            )
+            dummy_scalars: torch.Tensor = torch.zeros(
+                1, scalar_channels, device=device, dtype=dtype
+            )
+            dummy_dist: torch.Tensor = torch.zeros(1, device=device, dtype=dtype)
+            for _, key in zip(self._dedicated_pairs, self._pair_keys):
+                expert = typing.cast(PairwiseExpert, self.experts[key])
+                _ = expert.project(atom_features)
+                dummy_out: torch.Tensor = expert(dummy_scalars, dummy_scalars, dummy_dist)
+                atom_energies = atom_energies + 0.0 * dummy_out.sum()
+            if self.rare_expert is not None:
+                _ = self.rare_expert.project(atom_features)
+                dummy_idx_re: torch.Tensor = torch.zeros(1, dtype=torch.long, device=device)
+                dummy_re: torch.Tensor = self.rare_expert(
+                    dummy_scalars, dummy_scalars, dummy_dist, dummy_idx_re
+                )
+                atom_energies = atom_energies + 0.0 * dummy_re.sum()
+            return atom_energies, atom_forces
+
+        edge_vectors_dt: torch.Tensor = edge_vectors.to(dtype)
+        edge_lengths: torch.Tensor = edge_vectors_dt.norm(dim=-1)
+        cut_env: torch.Tensor = cosine_cutoff(edge_lengths, self._cutoff).to(dtype)
+        cut_env_v: torch.Tensor = cut_env.unsqueeze(-1)
+
+        z_row: torch.Tensor = atomic_numbers[row]
+        z_col: torch.Tensor = atomic_numbers[col]
+        z_lo: torch.Tensor = torch.minimum(z_row, z_col)
+        z_hi: torch.Tensor = torch.maximum(z_row, z_col)
+
+        # ---- Dedicated pair loop ----
+        for (a, b), key in zip(self._dedicated_pairs, self._pair_keys):
+            expert = typing.cast(PairwiseExpert, self.experts[key])
+            mask: torch.Tensor = ((z_lo == a) & (z_hi == b)).to(dtype)
+            mask_v: torch.Tensor = mask.unsqueeze(-1)
+            scalars: torch.Tensor = expert.project(atom_features)
+            scalars_a: torch.Tensor = scalars[row] * mask_v
+            scalars_b: torch.Tensor = scalars[col] * mask_v
+            e_ij, f_ij = expert.forward_pairwise(scalars_a, scalars_b, edge_vectors_dt)
+            tapered_e: torch.Tensor = e_ij * mask * cut_env
+            tapered_f: torch.Tensor = f_ij * mask_v * cut_env_v
+            atom_energies = atom_energies.index_add(0, row, 0.5 * tapered_e)
+            atom_forces = atom_forces.index_add(0, row, 0.5 * tapered_f)
+            atom_forces = atom_forces.index_add(0, col, -0.5 * tapered_f)
+
+        # ---- Rare pairs via shared RarePairExpert (energy only, no pairwise forces) ----
+        # RarePairExpert doesn't implement forward_pairwise; use regular forward
+        # and let the backbone's autograd head derive forces from positions.
+        if self.rare_expert is not None:
+            rare_scalars: torch.Tensor = self.rare_expert.project(atom_features)
+            for local_idx, (a, b) in enumerate(self._rare_pairs):
+                mask = ((z_lo == a) & (z_hi == b)).to(dtype)
+                mask_col_re = mask.unsqueeze(-1)
+                sa_re: torch.Tensor = rare_scalars[row] * mask_col_re
+                sb_re: torch.Tensor = rare_scalars[col] * mask_col_re
+                di_re: torch.Tensor = edge_lengths * mask
+                pidx_re: torch.Tensor = torch.full(
+                    (E,), local_idx, dtype=torch.long, device=device
+                )
+                pair_e_re: torch.Tensor = self.rare_expert(sa_re, sb_re, di_re, pidx_re)
+                tapered_re: torch.Tensor = pair_e_re * mask * cut_env
+                atom_energies = atom_energies.index_add(0, row, 0.5 * tapered_re)
+
+        return atom_energies, atom_forces

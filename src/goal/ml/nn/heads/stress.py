@@ -84,9 +84,20 @@ class StressHead(nn.Module):
             # Virial contribution from pairwise interactions
             # stress = -(1/V) * sum_edges (r_ij outer f_j)
             row, col = graph.edge_index  # (E,), (E,)
+            # Edge displacement vectors.  ``AtomicGraph.from_ase`` no
+            # longer stores these on the graph (they were redundant with
+            # ``positions`` + ``edge_index`` in every force-prediction
+            # pipeline).  Fall back to a fresh computation here so stress
+            # training keeps working without re-introducing the per-batch
+            # storage cost.
+            edge_vectors_stored: torch.Tensor | None = graph.get("edge_attr", None)
+            if edge_vectors_stored is None:
+                from goal.ml.nn.models.kronos.geometry import differentiable_edges
+
+                edge_vectors_stored, _ = differentiable_edges(graph, graph.pos)
             virial = torch.einsum(  # (E, 3, 3)
                 "ei,ej->eij",
-                graph.edge_attr,  # (E, 3)
+                edge_vectors_stored,  # (E, 3)
                 forces_neg[col],  # (E, 3)
             )
 

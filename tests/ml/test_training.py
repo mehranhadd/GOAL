@@ -194,6 +194,142 @@ class TestConfigurableLossFn:
         assert not torch.allclose(mse_loss, mae_loss)
 
 
+class _FakeBatch(dict):
+    """Minimal dict subclass that also exposes ``batch`` and ``weight`` as attributes.
+
+    The real training loop passes a PyG ``AtomicGraph`` / ``Batch`` object to the
+    loss, which supports both ``target["forces"]`` (dict subscript, because ``Data``
+    subclasses ``dict``) and ``getattr(target, "batch", None)`` (attribute access).
+    This helper replicates that dual interface for unit tests without requiring a
+    full PyG graph.
+    """
+
+    def __init__(self, batch: torch.Tensor | None = None, **kwargs: torch.Tensor) -> None:
+        super().__init__(**kwargs)
+        self.batch = batch
+        self.weight: torch.Tensor | None = None
+
+
+class TestForcesLossNormalization:
+    """Per-structure normalisation of the force loss (normalize_by_n_atoms)."""
+
+    def test_flat_mean_no_batch_info(self) -> None:
+        """When target has no batch attribute, flat mean is used regardless of flag."""
+        from goal.ml.training.loss import ForcesLoss
+
+        pred_f = torch.randn(5, 3)
+        target_f = torch.randn(5, 3)
+        loss_norm = ForcesLoss(loss_fn="mae", normalize_by_n_atoms=True)
+        loss_flat = ForcesLoss(loss_fn="mae", normalize_by_n_atoms=False)
+        expected = torch.nn.functional.l1_loss(pred_f, target_f)
+
+        # Both fall back to flat mean when no batch attribute
+        assert torch.allclose(loss_norm({"forces": pred_f}, {"forces": target_f}), expected)
+        assert torch.allclose(loss_flat({"forces": pred_f}, {"forces": target_f}), expected)
+
+    def test_equal_size_structures_give_same_result(self) -> None:
+        """When all structures have the same number of atoms, per-structure
+        normalisation and flat mean give identical results (both weight each
+        atom equally when structures are the same size)."""
+        from goal.ml.training.loss import ForcesLoss
+
+        torch.manual_seed(0)
+        n_atoms = 5
+        n_structs = 3
+        pred_f = torch.randn(n_atoms * n_structs, 3)
+        target_f = torch.randn(n_atoms * n_structs, 3)
+        batch_index = torch.repeat_interleave(torch.arange(n_structs), n_atoms)
+        target = _FakeBatch(batch=batch_index, forces=target_f)
+
+        loss_norm = ForcesLoss(loss_fn="mae", normalize_by_n_atoms=True)
+        loss_flat = ForcesLoss(loss_fn="mae", normalize_by_n_atoms=False)
+
+        val_norm = loss_norm({"forces": pred_f}, target)
+        val_flat = loss_flat({"forces": pred_f}, target)
+
+        assert torch.allclose(
+            val_norm, val_flat, atol=1e-6
+        ), "With equal-size structures, per-structure and flat-mean losses should agree."
+
+    def test_large_structure_dominates_without_normalisation(self) -> None:
+        """Without normalisation, a large structure dominates the gradient.
+        With per-structure normalisation, both structures contribute equally.
+
+        Build a batch with a 2-atom and a 10-atom molecule, random predictions
+        and zero targets (error = prediction itself).  Verify the formulas:
+
+            per-structure: mean(mae_struct_0, mae_struct_1)
+            flat:          mean over all 36 components (large mol has 5× more weight)
+        """
+        from goal.ml.training.loss import ForcesLoss
+
+        torch.manual_seed(7)
+        f_pred = torch.randn(12, 3)  # 2 + 10 atoms
+        f_target = torch.zeros(12, 3)
+        batch_index = torch.cat(
+            [torch.zeros(2, dtype=torch.long), torch.ones(10, dtype=torch.long)]
+        )
+        target = _FakeBatch(batch=batch_index, forces=f_target)
+        pred = {"forces": f_pred}
+
+        loss_norm = ForcesLoss(loss_fn="mae", normalize_by_n_atoms=True)
+        loss_flat = ForcesLoss(loss_fn="mae", normalize_by_n_atoms=False)
+
+        val_norm = loss_norm(pred, target)
+        val_flat = loss_flat(pred, target)
+
+        # Per-structure: mean(mae_struct_0, mae_struct_1) — equal weight per molecule
+        mae_0 = f_pred[:2].abs().mean()
+        mae_1 = f_pred[2:].abs().mean()
+        expected_norm = (mae_0 + mae_1) / 2.0
+
+        # Flat: mean over all 12 × 3 = 36 elements
+        expected_flat = f_pred.abs().mean()
+
+        assert torch.allclose(
+            val_norm, expected_norm, atol=1e-6
+        ), f"Per-structure loss = {val_norm.item():.6f}, expected {expected_norm.item():.6f}"
+        assert torch.allclose(
+            val_flat, expected_flat, atol=1e-6
+        ), f"Flat loss = {val_flat.item():.6f}, expected {expected_flat.item():.6f}"
+        assert not torch.allclose(
+            val_norm, val_flat
+        ), "Per-structure and flat losses unexpectedly agree for unequal-size structures."
+
+    def test_normalize_false_gives_old_behavior(self) -> None:
+        """normalize_by_n_atoms=False reproduces the original flat-mean formula."""
+        from goal.ml.training.loss import ForcesLoss
+
+        torch.manual_seed(3)
+        pred_f = torch.randn(8, 3)
+        target_f = torch.randn(8, 3)
+        batch_index = torch.tensor([0, 0, 0, 1, 1, 1, 1, 1])
+        target = _FakeBatch(batch=batch_index, forces=target_f)
+
+        loss = ForcesLoss(loss_fn="mae", normalize_by_n_atoms=False)
+        result = loss({"forces": pred_f}, target)
+        expected = torch.nn.functional.l1_loss(pred_f, target_f)
+        assert torch.allclose(result, expected)
+
+    def test_rmse_per_structure(self) -> None:
+        """RMSE variant: per-structure sqrt(MSE_m), then mean over structures."""
+        from goal.ml.training.loss import ForcesLoss
+
+        torch.manual_seed(5)
+        f_pred = torch.randn(6, 3)
+        f_target = torch.zeros(6, 3)
+        batch_index = torch.tensor([0, 0, 0, 1, 1, 1])
+        target = _FakeBatch(batch=batch_index, forces=f_target)
+
+        loss = ForcesLoss(loss_fn="rmse", normalize_by_n_atoms=True)
+        result = loss({"forces": f_pred}, target)
+
+        mse_0 = (f_pred[:3] ** 2).mean()
+        mse_1 = (f_pred[3:] ** 2).mean()
+        expected = (torch.sqrt(mse_0) + torch.sqrt(mse_1)) / 2.0
+        assert torch.allclose(result, expected, atol=1e-6)
+
+
 class TestEMA:
     """Verify the EMA wrapper."""
 

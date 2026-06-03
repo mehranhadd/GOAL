@@ -1,23 +1,50 @@
 """Shared fixtures for KRONOS tests.
 
-Provides hand-crafted molecules (methane, water, methylamine) wrapped as
-``AtomicGraph`` / PyG ``Batch`` so that the model tests can run without
-touching any dataset on disk.  Float64 is used throughout because GOAL's
-default dtype is ``torch.float64`` and several equivariant primitives
-(Bessel basis, polynomial envelope) register their constants in
-float64.
+Provides hand-crafted molecules (methane, water, methylamine) and optional
+real GMD trajectory data, all wrapped as ``AtomicGraph`` / PyG ``Batch``
+so that the model tests can run without touching any dataset on disk by
+default.  Float64 is used throughout because GOAL's default dtype is
+``torch.float64`` and several equivariant primitives (Bessel basis,
+polynomial envelope) register their constants in float64.
+
+Real GMD fixtures are conditionally loaded from::
+
+    data/GMD/FragmentDuplication/Training/O2C4H8_PBE.traj
+
+Tests that depend on them are automatically skipped when the file is absent.
 """
 
 from __future__ import annotations
 
 import math
 import typing
+from pathlib import Path
 
 import pytest
 import torch
 from torch_geometric.data import Batch
 
 from goal.ml.data.graph import AtomicGraph
+
+# ---------------------------------------------------------------------------
+# GMD trajectory path — relative to the project root
+# ---------------------------------------------------------------------------
+
+_GMD_TRAJ: Path = (
+    Path(__file__).parents[3]  # …/tests/ml/kronos → project root
+    / "data"
+    / "GMD"
+    / "FragmentDuplication"
+    / "Training"
+    / "O2C4H8_PBE.traj"
+)
+
+_GMD_AVAILABLE: bool = _GMD_TRAJ.exists()
+
+requires_gmd = pytest.mark.skipif(
+    not _GMD_AVAILABLE,
+    reason=f"GMD trajectory not found at {_GMD_TRAJ}",
+)
 
 
 def _build_graph(
@@ -138,3 +165,30 @@ def random_so3() -> torch.Tensor:
 
     rot: torch.Tensor = torch.tensor(R.random().as_matrix(), dtype=torch.float64)
     return rot
+
+
+@pytest.fixture(scope="module")
+def gmd_batch() -> Batch:
+    """PyG Batch built from the first 4 frames of the GMD O2C4H8 trajectory.
+
+    Skipped automatically when the trajectory file is not present on disk.
+    All graphs are built with explicit ``edge_vectors`` / ``edge_lengths``
+    (the same convention used by the hand-crafted fixtures above) so they
+    can be passed directly to ``EnvironmentDressing`` and the interaction
+    block without recomputation.
+    """
+    if not _GMD_AVAILABLE:
+        pytest.skip(f"GMD trajectory not found at {_GMD_TRAJ}")
+
+    try:
+        from ase.io import read as ase_read
+    except ImportError:
+        pytest.skip("ase not installed")
+
+    frames = ase_read(str(_GMD_TRAJ), index=slice(0, 4))
+    graphs: list[AtomicGraph] = []
+    for atoms in frames:
+        pos = torch.tensor(atoms.get_positions(), dtype=torch.float64)
+        z = torch.tensor(atoms.get_atomic_numbers(), dtype=torch.long)
+        graphs.append(_build_graph(pos, z, cutoff=5.0))
+    return Batch.from_data_list(graphs)

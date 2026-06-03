@@ -1,0 +1,430 @@
+"""Three-pool checkpoint manager for GOAL training.
+
+Pools
+-----
+1. top_k  — keep the K best checkpoints ranked by a validation metric.
+2. interval — keep the last N checkpoints saved every M epochs.
+3. last  — always overwrite last.ckpt (for crash recovery / resume).
+
+All checkpoint writes are atomic (write to .tmp then os.replace).
+Pool membership is persisted to checkpoint_state.json so resumed
+training can continue managing deletions correctly.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import warnings
+from collections import deque
+from pathlib import Path
+from typing import Any
+
+import lightning as L
+from lightning import Callback
+
+log = logging.getLogger(__name__)
+
+# Metric names whose natural direction is "lower is better"
+_KNOWN_MIN_METRICS: frozenset[str] = frozenset(
+    {
+        "val/total",
+        "val/energy_mae",
+        "val/forces_mae",
+        "val/energy_mse",
+        "val/forces_mse",
+        "val/loss",
+        "train/loss",
+    }
+)
+
+# Metric names whose natural direction is "higher is better"
+_KNOWN_MAX_METRICS: frozenset[str] = frozenset(
+    {
+        "val/forces_cosine_similarity",
+        "val/accuracy",
+        "val/r2",
+    }
+)
+
+
+def _is_better(new: float, old: float, mode: str) -> bool:
+    if mode == "min":
+        return new < old
+    return new > old
+
+
+def _worst_index(pool: list[tuple[float, str]], mode: str) -> int:
+    """Return the index of the worst entry in the top-k pool."""
+    if mode == "min":
+        # Worst = highest value
+        return max(range(len(pool)), key=lambda i: pool[i][0])
+    # Worst = lowest value
+    return min(range(len(pool)), key=lambda i: pool[i][0])
+
+
+class GOALCheckpointManager(Callback):
+    """Three-pool checkpoint manager.
+
+    Parameters
+    ----------
+    dirpath:
+        Directory where checkpoints are saved.  Defaults to the
+        Lightning trainer's log directory if ``None``.
+    top_k:
+        Config dict for pool 1.  Keys: ``enabled``, ``k``, ``metric``, ``mode``.
+    interval:
+        Config dict for pool 2.  Keys: ``enabled``, ``every_n_epochs``, ``keep_last_n``.
+    last:
+        Config dict for pool 3.  Keys: ``enabled``, ``filename``.
+    """
+
+    def __init__(
+        self,
+        dirpath: str | None = None,
+        top_k: dict[str, Any] | None = None,
+        interval: dict[str, Any] | None = None,
+        last: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+
+        self._dirpath: str | None = dirpath
+
+        # --- Pool 1 config ---
+        _tk = top_k or {}
+        self.top_k_enabled: bool = bool(_tk.get("enabled", True))
+        self.top_k_k: int = int(_tk.get("k", 5))
+        self.top_k_metric: str = str(_tk.get("metric", "val/forces_mae"))
+        self.top_k_mode: str = str(_tk.get("mode", "min"))
+        if self.top_k_mode not in ("min", "max"):
+            raise ValueError(f"top_k.mode must be 'min' or 'max', got '{self.top_k_mode}'")
+
+        # Warn if mode looks inconsistent with the metric name
+        if self.top_k_enabled:
+            self._warn_mode_mismatch()
+
+        # --- Pool 2 config ---
+        _iv = interval or {}
+        self.interval_enabled: bool = bool(_iv.get("enabled", True))
+        self.interval_every_n: int = int(_iv.get("every_n_epochs", 2))
+        self.interval_keep_n: int = int(_iv.get("keep_last_n", 5))
+
+        # --- Pool 3 config ---
+        _la = last or {}
+        self.last_enabled: bool = bool(_la.get("enabled", True))
+        self.last_filename: str = str(_la.get("filename", "last.ckpt"))
+
+        # --- Runtime state ---
+        # Pool 1: list of (metric_value, filepath)
+        self._top_k_pool: list[tuple[float, str]] = []
+        # Pool 2: deque of filepaths (oldest first)
+        self._interval_pool: deque[str] = deque(maxlen=None)
+        # Pool 3: path to last.ckpt
+        self._last_ckpt_path: str | None = None
+
+        # resolved dirpath (set in setup)
+        self._resolved_dirpath: str | None = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def setup(self, trainer: L.Trainer, pl_module: L.LightningModule, stage: str) -> None:
+        """Resolve dirpath and attempt to restore pool state from disk."""
+        if stage != "fit":
+            return
+
+        if self._dirpath is not None:
+            self._resolved_dirpath = self._dirpath
+        else:
+            # Fall back to Lightning's default log directory
+            log_dir = trainer.log_dir or trainer.default_root_dir
+            self._resolved_dirpath = str(Path(log_dir) / "checkpoints")
+
+        os.makedirs(self._resolved_dirpath, exist_ok=True)
+
+        # Try to restore pool state from a previous run
+        state_path = Path(self._resolved_dirpath) / "checkpoint_state.json"
+        if state_path.exists():
+            self._load_state(state_path)
+
+    # ------------------------------------------------------------------
+    # Main hook
+    # ------------------------------------------------------------------
+
+    def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        if not trainer.is_global_zero:
+            return
+        if self._resolved_dirpath is None:
+            return
+
+        epoch: int = trainer.current_epoch
+        metrics: dict[str, Any] = trainer.callback_metrics
+
+        # Pool 1 — top-k by metric
+        if self.top_k_enabled:
+            self._update_top_k(trainer, epoch, metrics)
+
+        # Pool 2 — interval
+        if self.interval_enabled and (epoch % self.interval_every_n == 0):
+            self._update_interval(trainer, epoch)
+
+        # Pool 3 — always save last
+        if self.last_enabled:
+            self._update_last(trainer)
+
+        # Persist pool state after every epoch
+        self._save_state()
+
+    # ------------------------------------------------------------------
+    # Pool 1
+    # ------------------------------------------------------------------
+
+    def _update_top_k(
+        self,
+        trainer: L.Trainer,
+        epoch: int,
+        metrics: dict[str, Any],
+    ) -> None:
+        if self.top_k_metric not in metrics:
+            log.warning(
+                "GOALCheckpointManager: top_k metric '%s' not found in callback_metrics "
+                "(available: %s). Skipping top-k save.",
+                self.top_k_metric,
+                list(metrics.keys()),
+            )
+            return
+
+        value: float = float(metrics[self.top_k_metric])
+        metric_slug = self.top_k_metric.replace("/", "_")
+        filename = f"best_{metric_slug}={value:.4f}_epoch={epoch:04d}.ckpt"
+        filepath = str(Path(self._resolved_dirpath) / filename)
+
+        if len(self._top_k_pool) < self.top_k_k:
+            # Pool not full yet — always save
+            self._save_atomic(trainer, filepath)
+            self._top_k_pool.append((value, filepath))
+            log.info(
+                "[ckpt/top_k] Saved %s (pool size %d/%d)",
+                filename,
+                len(self._top_k_pool),
+                self.top_k_k,
+            )
+        else:
+            worst_idx = _worst_index(self._top_k_pool, self.top_k_mode)
+            worst_value, worst_path = self._top_k_pool[worst_idx]
+
+            if _is_better(value, worst_value, self.top_k_mode):
+                # New checkpoint is better than the worst — save and evict
+                self._save_atomic(trainer, filepath)
+                # Only delete if the file is not also in the interval pool
+                if worst_path not in self._interval_pool:
+                    _delete_file(worst_path)
+                    log.info("[ckpt/top_k] Evicted %s", Path(worst_path).name)
+                else:
+                    log.info(
+                        "[ckpt/top_k] Evicted from top-k but kept (in interval pool): %s",
+                        Path(worst_path).name,
+                    )
+                self._top_k_pool[worst_idx] = (value, filepath)
+                log.info("[ckpt/top_k] Saved %s (replaced worst %.4f)", filename, worst_value)
+            else:
+                log.debug(
+                    "[ckpt/top_k] Skipped epoch %d (value %.4f not better than worst %.4f)",
+                    epoch,
+                    value,
+                    worst_value,
+                )
+
+    # ------------------------------------------------------------------
+    # Pool 2
+    # ------------------------------------------------------------------
+
+    def _update_interval(self, trainer: L.Trainer, epoch: int) -> None:
+        filename = f"interval_epoch={epoch:04d}.ckpt"
+        filepath = str(Path(self._resolved_dirpath) / filename)
+
+        # If pool is at capacity, evict the oldest
+        if len(self._interval_pool) >= self.interval_keep_n:
+            oldest_path = self._interval_pool[0]
+            # Only delete if not in top-k pool
+            top_k_paths = {p for _, p in self._top_k_pool}
+            if oldest_path not in top_k_paths:
+                _delete_file(oldest_path)
+                log.info("[ckpt/interval] Evicted %s", Path(oldest_path).name)
+            else:
+                log.info(
+                    "[ckpt/interval] Evicted from interval but kept (in top-k pool): %s",
+                    Path(oldest_path).name,
+                )
+            self._interval_pool.popleft()
+
+        self._save_atomic(trainer, filepath)
+        self._interval_pool.append(filepath)
+        log.info(
+            "[ckpt/interval] Saved %s (pool size %d/%d)",
+            filename,
+            len(self._interval_pool),
+            self.interval_keep_n,
+        )
+
+    # ------------------------------------------------------------------
+    # Pool 3
+    # ------------------------------------------------------------------
+
+    def _update_last(self, trainer: L.Trainer) -> None:
+        filepath = str(Path(self._resolved_dirpath) / self.last_filename)
+        self._save_atomic(trainer, filepath)
+        self._last_ckpt_path = filepath
+
+    # ------------------------------------------------------------------
+    # Atomic write
+    # ------------------------------------------------------------------
+
+    def _save_atomic(self, trainer: L.Trainer, filepath: str) -> None:
+        """Write checkpoint atomically: write to .tmp then os.replace."""
+        tmp_path = filepath + ".tmp"
+        trainer.save_checkpoint(tmp_path)
+        os.replace(tmp_path, filepath)
+
+    # ------------------------------------------------------------------
+    # State persistence
+    # ------------------------------------------------------------------
+
+    def _save_state(self) -> None:
+        if self._resolved_dirpath is None:
+            return
+        state = {
+            "top_k_pool": self._top_k_pool,
+            "interval_pool": list(self._interval_pool),
+            "last_ckpt_path": self._last_ckpt_path,
+            "config": {
+                "top_k_k": self.top_k_k,
+                "top_k_metric": self.top_k_metric,
+                "top_k_mode": self.top_k_mode,
+                "interval_every_n": self.interval_every_n,
+                "interval_keep_n": self.interval_keep_n,
+                "last_filename": self.last_filename,
+            },
+        }
+        state_path = Path(self._resolved_dirpath) / "checkpoint_state.json"
+        tmp_path = str(state_path) + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp_path, str(state_path))
+
+    def _load_state(self, state_path: Path) -> None:
+        """Restore pool state from a previous run's checkpoint_state.json."""
+        try:
+            with open(state_path) as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning(
+                "GOALCheckpointManager: could not load checkpoint_state.json (%s). "
+                "Starting with empty pools.",
+                exc,
+            )
+            return
+
+        raw_top_k = state.get("top_k_pool", [])
+        # Each entry is [value, path] from JSON
+        restored_top_k: list[tuple[float, str]] = []
+        for entry in raw_top_k:
+            val, path = float(entry[0]), str(entry[1])
+            if Path(path).exists():
+                restored_top_k.append((val, path))
+            else:
+                log.warning("[ckpt/resume] top_k file missing on disk, dropping: %s", path)
+        self._top_k_pool = restored_top_k
+
+        restored_interval: list[str] = []
+        for path in state.get("interval_pool", []):
+            if Path(path).exists():
+                restored_interval.append(str(path))
+            else:
+                log.warning("[ckpt/resume] interval file missing on disk, dropping: %s", path)
+        self._interval_pool = deque(restored_interval)
+
+        last = state.get("last_ckpt_path")
+        if last and Path(last).exists():
+            self._last_ckpt_path = last
+        elif last:
+            log.warning("[ckpt/resume] last.ckpt path in state does not exist: %s", last)
+
+        log.info(
+            "[ckpt/resume] Restored pools: top_k=%d, interval=%d, last=%s",
+            len(self._top_k_pool),
+            len(self._interval_pool),
+            self._last_ckpt_path,
+        )
+
+    # ------------------------------------------------------------------
+    # Class-method for train.py to restore state into a fresh instance
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def restore_pools_from_dir(cls, manager: GOALCheckpointManager, dirpath: str) -> None:
+        """Load checkpoint_state.json from ``dirpath`` into ``manager``.
+
+        Called by train.py after constructing the manager but before
+        ``trainer.fit()``, so pool state survives a crash/resume cycle.
+        """
+        state_path = Path(dirpath) / "checkpoint_state.json"
+        if state_path.exists():
+            manager._resolved_dirpath = dirpath
+            manager._load_state(state_path)
+        else:
+            log.info("[ckpt/resume] No checkpoint_state.json in %s — starting fresh.", dirpath)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _warn_mode_mismatch(self) -> None:
+        metric = self.top_k_metric
+        mode = self.top_k_mode
+        if metric in _KNOWN_MIN_METRICS and mode != "min":
+            warnings.warn(
+                f"GOALCheckpointManager: metric '{metric}' is typically minimised "
+                f"but mode='{mode}' was given.  Set mode='min' unless you intend this.",
+                UserWarning,
+                stacklevel=3,
+            )
+        elif metric in _KNOWN_MAX_METRICS and mode != "max":
+            warnings.warn(
+                f"GOALCheckpointManager: metric '{metric}' is typically maximised "
+                f"but mode='{mode}' was given.  Set mode='max' unless you intend this.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+    @property
+    def dirpath(self) -> str | None:
+        return self._resolved_dirpath
+
+    @property
+    def top_k_pool(self) -> list[tuple[float, str]]:
+        return list(self._top_k_pool)
+
+    @property
+    def interval_pool(self) -> list[str]:
+        return list(self._interval_pool)
+
+    @property
+    def last_ckpt_path(self) -> str | None:
+        return self._last_ckpt_path
+
+
+# ------------------------------------------------------------------
+# File helpers
+# ------------------------------------------------------------------
+
+
+def _delete_file(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("GOALCheckpointManager: could not delete %s: %s", path, exc)

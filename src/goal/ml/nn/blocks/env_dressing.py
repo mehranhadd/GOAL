@@ -4,32 +4,31 @@ Produces "dressed" per-atom features that already carry information from
 each atom's local neighbourhood, before they are fed into downstream
 blocks (the KRONOS pairwise experts, scalar readouts, etc.).
 
-Pipeline:
-
+Pipeline
+--------
 1. Look up an initial scalar embedding from the atomic number.
 2. Project the scalars into an equivariant feature space (irreps
    ``hidden_channels x 0e + 1o + 2e ...``).
-3. Build edge spherical harmonics ``Y^l(r_hat)`` and a radial expansion
-   ``MLP(Bessel(d))`` weighted by a smooth envelope.
-4. Run one (or several) ACE-style message-passing layer(s): a
-   fully-connected, weighted tensor product between sender node
-   features and edge spherical harmonics, aggregated by sum.  The
-   output is the one-particle basis ``A_i`` of ACE.
-5. Optional ACE body-order expansion:
+3. **Compute edge spherical harmonics once** from the edge vectors —
+   these are shared across all interaction layers (they depend only on
+   geometry, not on learnable parameters).
+4. Compute the radial basis + envelope per edge — also geometry-only
+   and reused across layers.
+5. Run ``num_interactions`` GNN-style message-passing layers:
+   each layer uses the **previous layer's output** as neighbour features
+   (multi-hop, not single-hop ACE).  Layer ``l`` receives the pre-computed
+   SH and produces updated node features with a residual connection.
+   Optionally, the TP weights in each layer are modulated by the central
+   atom's element type (``element_conditioned=True``).
+6. Optional per-layer energy readout: attach a small MLP after each
+   interaction layer that maps node features → per-node scalar energy.
+   Summing all per-layer contributions gives a body-order decomposition
+   of the energy (MACE-style).
+7. Optional ACE body-order expansion on the *final* layer's features:
 
-   * ``body_order = 1`` (default) — output is ``A_i`` (3-body
-     interactions via the message-passing tensor product).
-   * ``body_order = 2`` — output is ``B²_i = A_i ⊗_CG A_i``
-     (captures bond *angles*; 4-body in total).
-   * ``body_order = 3`` — output is ``B³_i = B²_i ⊗_CG A_i``
-     (captures *dihedrals*; 5-body in total).
-
-The CG-product output irreps for each body order are derived
-**programmatically** from the angular-momentum decomposition (see
-:func:`cg_product_irreps`); they are *not* hard-coded.  An equivariant
-``Linear`` then compresses the result back to the standard
-``irreps_hidden`` shape so the downstream expert interface is
-unchanged regardless of body order.
+   * ``body_order = 1`` — output is the final ``h_L`` directly.
+   * ``body_order = 2`` — output is ``B² = h_L ⊗_CG h_L``.
+   * ``body_order = 3`` — output is ``B³ = B² ⊗_CG h_L``.
 
 All sub-modules are taken from ``goal.ml.nn.{primitives,blocks}`` so the
 dressing block reuses the equivariant primitives already shipped with
@@ -42,25 +41,23 @@ import typing
 
 import torch
 import torch.nn as nn
-from e3nn.o3 import FullyConnectedTensorProduct, Irreps
+from e3nn.o3 import FullyConnectedTensorProduct, Irreps, spherical_harmonics
 
 from goal.ml.nn.blocks.embedding import AtomicNumberEmbedding
 from goal.ml.nn.blocks.interaction import EquivariantInteractionBlock
+from goal.ml.nn.blocks.symmetric_contraction import SymmetricContraction
 from goal.ml.nn.primitives.linear import EquivariantLinear
 
 
 def build_hidden_irreps(hidden_channels: int, lmax: int) -> Irreps:
     """Build the standard KRONOS hidden irreps specification.
 
-    Convention:
-
-    - Even angular momenta ``l`` get parity ``e``.
-    - Odd angular momenta ``l`` get parity ``o``.
+    Convention: even ``l`` → parity ``e``; odd ``l`` → parity ``o``.
 
     Parameters
     ----------
     hidden_channels : int
-        Multiplicity of every angular-momentum block (e.g. 32 → ``32x0e``).
+        Multiplicity of every angular-momentum block.
     lmax : int
         Largest angular momentum (inclusive).
     """
@@ -87,24 +84,17 @@ def cg_product_irreps(
 ) -> Irreps:
     """Irreps of the Clebsch-Gordan product ``irreps1 ⊗ irreps2``, truncated to ``l ≤ lmax``.
 
-    Used by KRONOS to derive the ACE body-order output irreps
-    programmatically — never hard-coded — so the shape of ``B²`` and
-    ``B³`` is always exactly what the angular-momentum algebra dictates.
-
     Parameters
     ----------
     irreps1, irreps2 : Irreps
         Input irreps.
     lmax : int
-        Drop output irreps with ``l > lmax`` to keep tensor widths
-        bounded.
+        Drop output irreps with ``l > lmax`` to keep tensor widths bounded.
 
     Returns
     -------
     Irreps
-        Simplified irreps of the truncated CG product.  Multiplicities
-        coming from different ``(mul1 × mul2)`` contributions are
-        summed by ``Irreps.simplify``.
+        Simplified irreps of the truncated CG product.
     """
     out_list: list[tuple[int, tuple[int, int]]] = []
     for mul1, ir1 in irreps1:
@@ -115,36 +105,80 @@ def cg_product_irreps(
     return Irreps(out_list).simplify()
 
 
+class _LayerReadout(nn.Module):
+    """Per-layer scalar energy readout.
+
+    Extracts the ``l=0`` scalars from equivariant node features and passes
+    them through a 2-layer MLP to produce a per-node scalar energy.
+
+    Architecture (mirrors MACE's LinearReadoutBlock for early layers):
+        EquivariantLinear(irreps → scalars) → Linear(S, S//2) → SiLU → Linear(S//2, 1)
+    """
+
+    def __init__(self, irreps_in: Irreps) -> None:
+        super().__init__()
+        num_scalars: int = sum(mul for mul, ir in irreps_in if ir.l == 0)
+        scalar_irreps: Irreps = Irreps(f"{num_scalars}x0e")
+        self.to_scalars = EquivariantLinear(irreps_in, scalar_irreps)
+        hidden: int = max(1, num_scalars // 2)
+        self.mlp = nn.Sequential(
+            nn.Linear(num_scalars, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, node_feats: torch.Tensor) -> torch.Tensor:
+        """``(N, irreps.dim) → (N,)`` per-node scalar energy."""
+        scalars = self.to_scalars(node_feats)  # (N, num_scalars)
+        return self.mlp(scalars).squeeze(-1)  # (N,)
+
+
 class EnvironmentDressing(nn.Module):
-    """Equivariant environment-dressing block with optional ACE body-order expansion.
+    """Equivariant environment-dressing block with GNN-style multi-layer MP.
 
     Parameters
     ----------
     num_elements : int
-        Size of the atomic-number embedding table.  Must be large enough
-        to cover the maximum ``Z`` in the dataset (e.g. ``9`` is enough
-        for H/C/N/O, ``120`` covers the whole periodic table).
+        Size of the atomic-number embedding table.
     embedding_dim : int
         Width of the initial scalar embedding.
     hidden_channels : int
-        Multiplicity used for every ``l`` block in the hidden features
-        and (after compression) in the output features.
+        Multiplicity per ``l`` block.
     lmax : int
         Highest spherical-harmonic order ``l`` to include.
     num_radial_basis : int
-        Number of Bessel basis functions used by the radial MLP.
+        Number of Bessel basis functions.
     cutoff : float
-        Cutoff radius (Angstrom).  Shared between the radial basis and
-        the polynomial envelope inside the interaction block.
+        Cutoff radius (Angstrom).
     radial_mlp_hidden : int
-        Width of the hidden layer inside the radial MLP that produces
-        tensor-product weights.
-    num_message_passing : int
-        Number of message-passing rounds producing the one-particle
-        basis ``A_i``.  Defaults to ``1``.
+        Width of hidden layers in the radial MLP.
+    num_interactions : int
+        Number of GNN-style message-passing layers.  Each layer uses the
+        previous layer's output as neighbour features (multi-hop).
+        Also accepted as ``num_message_passing`` for backward compatibility.
     body_order : int
-        ACE body-order parameter (``1``, ``2`` or ``3``).  See module
-        docstring for the geometric interpretation.
+        ACE body-order parameter applied to the *final* layer's output
+        (``1``, ``2`` or ``3``).
+    avg_num_neighbors : float, optional
+        Mean degree at ``cutoff`` over the training set.
+    agg_norm_exponent : float, optional
+        Exponent for the aggregation normalisation (see
+        :class:`EquivariantInteractionBlock`).
+    element_conditioned : bool, optional
+        When ``True``, each interaction layer conditions its TP weights on
+        the destination atom's element type via a
+        ``Linear(n_elements, weight_numel, bias=False)`` map.  This is the
+        CHANGE-1 element-conditioning described in the KRONOS design doc.
+        Backward-compatible default is ``False``.
+    per_layer_readout : bool, optional
+        When ``True``, attach a :class:`_LayerReadout` after each
+        interaction layer and accumulate per-node energy contributions.
+        The accumulated sum is returned alongside the final equivariant
+        features; it is then added to the backbone's total energy on top
+        of the MoE contribution.  Default ``False`` (original behaviour).
+    symmetric_contraction : bool, optional
+        When ``True`` and ``body_order >= 2``, use MACE-style
+        :class:`SymmetricContraction` for the body-order expansion.
     """
 
     SUPPORTED_BODY_ORDERS: tuple[int, ...] = (1, 2, 3)
@@ -158,8 +192,16 @@ class EnvironmentDressing(nn.Module):
         num_radial_basis: int = 8,
         cutoff: float = 5.0,
         radial_mlp_hidden: int = 32,
-        num_message_passing: int = 1,
+        num_interactions: int = 2,
+        # backward-compat alias — takes priority only when num_interactions is
+        # at its default value and the old key is explicitly passed.
+        num_message_passing: int | None = None,
         body_order: int = 1,
+        avg_num_neighbors: float | None = None,
+        agg_norm_exponent: float = 1.0,
+        element_conditioned: bool = False,
+        per_layer_readout: bool = False,
+        symmetric_contraction: bool = False,
     ) -> None:
         super().__init__()
         if body_order not in self.SUPPORTED_BODY_ORDERS:
@@ -167,14 +209,21 @@ class EnvironmentDressing(nn.Module):
                 f"body_order must be one of {self.SUPPORTED_BODY_ORDERS}, got {body_order}."
             )
 
+        # Honour the legacy ``num_message_passing`` key when present.
+        if num_message_passing is not None:
+            num_interactions = int(num_message_passing)
+
         self._cutoff: float = cutoff
         self._hidden_channels: int = hidden_channels
         self._lmax: int = lmax
         self._body_order: int = body_order
         self._irreps_hidden: Irreps = build_hidden_irreps(hidden_channels, lmax)
         self._irreps_edge: Irreps = build_edge_irreps(lmax)
+        self._element_conditioned: bool = bool(element_conditioned)
+        self._per_layer_readout: bool = bool(per_layer_readout)
+        self._num_interactions: int = int(num_interactions)
 
-        # Scalar atomic embedding → equivariant features
+        # Initial scalar embedding → equivariant feature space
         self.embedding: AtomicNumberEmbedding = AtomicNumberEmbedding(
             num_elements=num_elements,
             embedding_dim=embedding_dim,
@@ -184,8 +233,11 @@ class EnvironmentDressing(nn.Module):
             scalar_irreps, self._irreps_hidden
         )
 
-        # Stack of ACE-style interaction blocks producing the one-particle
-        # basis A_i.
+        # GNN-style interaction layers (CHANGE 2: SH computed once outside)
+        self._avg_num_neighbors: float | None = (
+            float(avg_num_neighbors) if avg_num_neighbors is not None else None
+        )
+        self._agg_norm_exponent: float = float(agg_norm_exponent)
         self.interactions: nn.ModuleList = nn.ModuleList(
             [
                 EquivariantInteractionBlock(
@@ -194,25 +246,41 @@ class EnvironmentDressing(nn.Module):
                     num_basis=num_radial_basis,
                     cutoff=cutoff,
                     hidden_dim=radial_mlp_hidden,
+                    avg_num_neighbors=self._avg_num_neighbors,
+                    agg_norm_exponent=self._agg_norm_exponent,
+                    element_conditioned=element_conditioned,
+                    n_elements=num_elements,
                 )
-                for _ in range(num_message_passing)
+                for _ in range(self._num_interactions)
             ]
         )
 
-        # ----- Body-order expansion -----
-        #
-        # B² and B³ are built by tensor-producting A with itself / with
-        # the previous B; the output irreps come from the CG algebra
-        # (no hard-coded shapes) and are then compressed back to
-        # ``irreps_hidden`` so the expert interface stays unchanged.
+        # Per-layer readouts (CHANGE 3)
+        self.readouts: nn.ModuleList = nn.ModuleList(
+            [_LayerReadout(self._irreps_hidden) for _ in range(self._num_interactions)]
+            if per_layer_readout
+            else []
+        )
+
+        # Body-order expansion on the final layer's output
+        self._symmetric_contraction: bool = bool(symmetric_contraction)
         self.tp_b2: FullyConnectedTensorProduct | None = None
         self.proj_b2: EquivariantLinear | None = None
         self.tp_b3: FullyConnectedTensorProduct | None = None
         self.proj_b3: EquivariantLinear | None = None
+        self.sym_contraction: SymmetricContraction | None = None
         self._irreps_b2_full: Irreps | None = None
         self._irreps_b3_full: Irreps | None = None
 
-        if body_order >= 2:
+        if body_order >= 2 and self._symmetric_contraction:
+            self.sym_contraction = SymmetricContraction(
+                irreps_in=self._irreps_hidden,
+                irreps_out=self._irreps_hidden,
+                correlation=body_order,
+                num_elements=num_elements,
+            )
+
+        if body_order >= 2 and not self._symmetric_contraction:
             self._irreps_b2_full = cg_product_irreps(
                 self._irreps_hidden, self._irreps_hidden, lmax
             )
@@ -223,7 +291,7 @@ class EnvironmentDressing(nn.Module):
             )
             self.proj_b2 = EquivariantLinear(self._irreps_b2_full, self._irreps_hidden)
 
-        if body_order >= 3:
+        if body_order >= 3 and not self._symmetric_contraction:
             self._irreps_b3_full = cg_product_irreps(
                 self._irreps_hidden, self._irreps_hidden, lmax
             )
@@ -240,37 +308,42 @@ class EnvironmentDressing(nn.Module):
 
     @property
     def irreps_out(self) -> Irreps:
-        """Output irreps of the dressed atom features (unchanged by body order)."""
         return self._irreps_hidden
 
     @property
     def cutoff(self) -> float:
-        """Effective cutoff radius (Angstrom)."""
         return self._cutoff
 
     @property
     def lmax(self) -> int:
-        """Highest spherical-harmonic order used."""
         return self._lmax
 
     @property
     def hidden_channels(self) -> int:
-        """Multiplicity per ``l`` block."""
         return self._hidden_channels
 
     @property
     def body_order(self) -> int:
-        """ACE body-order parameter (``1``, ``2`` or ``3``)."""
         return self._body_order
 
     @property
+    def symmetric_contraction(self) -> bool:
+        return self._symmetric_contraction
+
+    @property
+    def element_conditioned(self) -> bool:
+        return self._element_conditioned
+
+    @property
+    def per_layer_readout(self) -> bool:
+        return self._per_layer_readout
+
+    @property
     def irreps_b2_full(self) -> Irreps | None:
-        """Internal (pre-compression) irreps of the B² tensor; ``None`` when ``body_order < 2``."""
         return self._irreps_b2_full
 
     @property
     def irreps_b3_full(self) -> Irreps | None:
-        """Internal (pre-compression) irreps of the B³ tensor; ``None`` when ``body_order < 3``."""
         return self._irreps_b3_full
 
     # ------------------------------------------------------------------
@@ -283,47 +356,75 @@ class EnvironmentDressing(nn.Module):
         edge_index: torch.Tensor,
         edge_vectors: torch.Tensor,
         edge_lengths: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run dressing including the ACE body-order expansion.
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run dressing: GNN-style multi-layer MP + optional body-order expansion.
 
         Parameters
         ----------
-        atomic_numbers : Tensor
-            Integer atomic numbers ``(N,)``.
-        edge_index : Tensor
-            Edge index ``(2, E)``.
-        edge_vectors : Tensor
-            Edge displacement vectors ``(E, 3)``.
-        edge_lengths : Tensor
-            Edge lengths ``(E,)``.
+        atomic_numbers : Tensor  ``(N,)``
+        edge_index : Tensor      ``(2, E)``
+        edge_vectors : Tensor    ``(E, 3)``
+        edge_lengths : Tensor    ``(E,)``
 
         Returns
         -------
-        Tensor
-            Dressed equivariant node features ``(N, irreps_out.dim)``.
+        tuple
+            ``(node_feats, layer_energies)`` where:
+
+            * ``node_feats`` — dressed equivariant features
+              ``(N, irreps_out.dim)`` (after body-order expansion if any).
+            * ``layer_energies`` — summed per-layer per-node scalar energies
+              ``(N,)`` when ``per_layer_readout=True``, else ``None``.
         """
         h: torch.Tensor = self.embedding(atomic_numbers)  # (N, embedding_dim)
         h = self.input_linear(h)  # (N, irreps_hidden.dim)
-        for interaction in self.interactions:
+
+        # ---- Compute edge SH once, reuse across all layers (CHANGE 2) ----
+        ev = edge_vectors.to(h.dtype)
+        edge_sh: torch.Tensor = spherical_harmonics(  # (E, irreps_edge.dim)
+            self._irreps_edge,
+            ev,
+            normalize=True,
+            normalization="component",
+        )
+
+        # ---- GNN-style interaction loop ----
+        layer_energies: torch.Tensor | None = None
+
+        for idx, interaction in enumerate(self.interactions):
             h = interaction(
                 node_feats=h,
                 edge_index=edge_index,
                 edge_vectors=edge_vectors,
                 edge_lengths=edge_lengths,
+                edge_sh=edge_sh,  # pre-computed SH (CHANGE 2)
+                atomic_numbers=atomic_numbers if self._element_conditioned else None,
             )
-        # ``h`` is now A_i, the one-particle basis.
 
+            # Per-layer readout contribution (CHANGE 3)
+            if self._per_layer_readout and len(self.readouts) > 0:
+                readout: _LayerReadout = typing.cast(_LayerReadout, self.readouts[idx])
+                layer_e: torch.Tensor = readout(h)  # (N,)
+                if layer_energies is None:
+                    layer_energies = layer_e
+                else:
+                    layer_energies = layer_energies + layer_e
+
+        # ---- Body-order expansion on final layer output ----
         if self._body_order == 1:
-            return h
+            return h, layer_energies
 
-        # B² = A ⊗_CG A, then compress to irreps_hidden
-        b2_full: torch.Tensor = self.tp_b2(h, h)  # (N, irreps_b2_full.dim)
-        b2: torch.Tensor = self.proj_b2(b2_full)  # (N, irreps_hidden.dim)
+        if self._symmetric_contraction:
+            assert self.sym_contraction is not None
+            return self.sym_contraction(h, atomic_numbers), layer_energies
+
+        assert self.tp_b2 is not None and self.proj_b2 is not None
+        b2_full: torch.Tensor = self.tp_b2(h, h)
+        b2: torch.Tensor = self.proj_b2(b2_full)
 
         if self._body_order == 2:
-            return b2
+            return b2, layer_energies
 
-        # B³ = B² ⊗_CG A, then compress
-        b3_full: torch.Tensor = self.tp_b3(b2, h)  # (N, irreps_b3_full.dim)
-        b3: torch.Tensor = self.proj_b3(b3_full)  # (N, irreps_hidden.dim)
-        return b3
+        assert self.tp_b3 is not None and self.proj_b3 is not None
+        b3_full: torch.Tensor = self.tp_b3(b2, h)
+        return self.proj_b3(b3_full), layer_energies

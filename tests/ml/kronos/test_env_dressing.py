@@ -59,7 +59,7 @@ class TestEnvironmentDressing:
 
     def test_forward_methane(self, methane_batch) -> None:  # noqa: ANN001
         dressing = self._make_dressing()
-        feats = dressing(
+        feats, layer_e = dressing(
             atomic_numbers=methane_batch.atomic_numbers,
             edge_index=methane_batch.edge_index,
             edge_vectors=methane_batch.edge_attr,
@@ -67,3 +67,4 @@ class TestEnvironmentDressing:
         )
         assert feats.shape == (methane_batch.num_atoms, dressing.irreps_out.dim)
         assert torch.isfinite(feats).all()
+        assert layer_e is None  # per_layer_readout defaults to False

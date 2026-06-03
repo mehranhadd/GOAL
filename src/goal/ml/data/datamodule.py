@@ -16,6 +16,7 @@ from pathlib import Path
 
 import lightning as L
 import torch
+from lightning.pytorch.utilities.rank_zero import rank_zero_info
 from omegaconf import DictConfig, ListConfig
 from torch.utils.data import DataLoader, Dataset, random_split
 from torch_geometric.loader import DataLoader as PyGDataLoader
@@ -201,18 +202,31 @@ class GOALDataModule(L.LightningDataModule):
         merge: str = data_cfg.get("merge_strategy", "sequential")
         seed: int = data_cfg.get("split_seed", 42)
 
+        rank_zero_info(
+            f"[DataModule] Setting up dataset  type={data_cfg.dataset_type!r}  "
+            f"cutoff={cutoff} Å  stage={stage!r}"
+        )
+
         has_dir: bool = "train_dir" in data_cfg and data_cfg.train_dir is not None
         has_per_split: bool = "train_paths" in data_cfg and data_cfg.train_paths is not None
 
         if has_dir:
-            # ---- Mode 4: directory-based per-split ----
+            rank_zero_info(f"[DataModule] Mode 4 — directory-based per-split loading")
             self._setup_from_dirs(ds_cls, data_cfg, cutoff, extra, merge, seed, stage)
         elif has_per_split:
-            # ---- Mode 2: per-split paths ----
+            rank_zero_info(f"[DataModule] Mode 2 — per-split path loading")
             self._setup_per_split(ds_cls, data_cfg, cutoff, extra, merge, seed, stage)
         else:
-            # ---- Mode 1 or 3: auto-split from root ----
+            rank_zero_info(f"[DataModule] Mode 1/3 — auto-split from root")
             self._setup_auto_split(ds_cls, data_cfg, cutoff, extra, merge, seed, stage)
+
+        # Report dataset sizes after setup
+        if self.data_train is not None:
+            rank_zero_info(f"[DataModule] Train  : {len(self.data_train):>8,} structures")
+        if self.data_val is not None:
+            rank_zero_info(f"[DataModule] Val    : {len(self.data_val):>8,} structures")
+        if self.data_test is not None:
+            rank_zero_info(f"[DataModule] Test   : {len(self.data_test):>8,} structures")
 
     def _setup_from_dirs(
         self,

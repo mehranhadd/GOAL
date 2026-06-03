@@ -112,8 +112,8 @@ class TestAceOrdersDiffer:
             edge_vectors=methane_batch.edge_attr,
             edge_lengths=methane_batch.edge_weight,
         )
-        f1 = d1(**kwargs)
-        f2 = d2(**kwargs)
+        f1, _ = d1(**kwargs)
+        f2, _ = d2(**kwargs)
         assert f1.shape == f2.shape
         assert not torch.allclose(f1, f2), (
             "ACE¹ and ACE² produced identical dressed features — "
@@ -130,8 +130,8 @@ class TestAceOrdersDiffer:
             edge_vectors=methane_batch.edge_attr,
             edge_lengths=methane_batch.edge_weight,
         )
-        f2 = d2(**kwargs)
-        f3 = d3(**kwargs)
+        f2, _ = d2(**kwargs)
+        f3, _ = d3(**kwargs)
         assert not torch.allclose(f2, f3), (
             "ACE² and ACE³ produced identical dressed features — "
             "the B³ tensor product is a no-op"
@@ -152,7 +152,8 @@ class TestAceOrdersEquivariant:
         dressing.eval()
 
         # Run on the original molecule
-        f_orig: torch.Tensor = dressing(
+        f_orig: torch.Tensor
+        f_orig, _ = dressing(
             atomic_numbers=batch.atomic_numbers,
             edge_index=batch.edge_index,
             edge_vectors=batch.edge_attr,
@@ -162,7 +163,8 @@ class TestAceOrdersEquivariant:
         # Run on a rotated copy
         R: torch.Tensor = random_so3()
         rotated: Batch = _rotate_batch(batch, R)
-        f_rot: torch.Tensor = dressing(
+        f_rot: torch.Tensor
+        f_rot, _ = dressing(
             atomic_numbers=rotated.atomic_numbers,
             edge_index=rotated.edge_index,
             edge_vectors=rotated.edge_attr,

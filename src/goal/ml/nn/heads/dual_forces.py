@@ -1,6 +1,6 @@
-"""Dual-forces head — autograd-derived forces with an optional direct correction.
+"""Dual-forces head — autograd-derived forces with optional corrections.
 
-Three force-prediction modes are supported, all selectable from config:
+Four force-prediction modes are supported, all selectable from config:
 
 * ``"autograd"`` (default)
     Forces come solely from ``-grad(E, positions)``.  Energy-conserving.
@@ -19,6 +19,13 @@ Three force-prediction modes are supported, all selectable from config:
     plays a residual / correction role.  Set ``correction_weight`` low
     (e.g. ``0.05``) to keep the conservative term dominant whilst still
     allowing the head to absorb systematic errors.
+* ``"pairwise"``
+    Forces come from the backbone's per-pair autograd
+    (``features.node_forces``).  Newton's third law is exact by
+    construction.  When ``pairwise_correction_weight > 0`` the
+    output is combined: ``F = F_autograd + w * F_pairwise``;
+    otherwise it's pure pairwise.  Requires a backbone with
+    ``compute_pairwise_forces=True`` (KRONOS).
 
 Set ``mode`` in the Hydra config — defaults to ``"autograd"`` so the
 behaviour matches ``EnergyForcesHead`` out of the box.
@@ -51,11 +58,23 @@ class DualForcesHead(nn.Module):
     hidden_dim : int
         Width of the scalar readout MLP.
     mode : str
-        ``"autograd"``, ``"direct"`` or ``"hybrid"``.
+        ``"autograd"``, ``"direct"``, ``"hybrid"`` or ``"pairwise"``.
     correction_weight : float
         Multiplier on the direct correction term in ``"hybrid"`` mode.
         Ignored otherwise.
+    pairwise_correction_weight : float
+        When ``mode == "pairwise"`` and this weight is ``> 0``, output
+        forces are ``F_autograd + w * F_pairwise`` (combined mode);
+        when ``0`` (default), output is pure pairwise.  Ignored in
+        the other three modes.
     """
+
+    _SUPPORTED_MODES: typing.ClassVar[set[str]] = {
+        "autograd",
+        "direct",
+        "hybrid",
+        "pairwise",
+    }
 
     def __init__(
         self,
@@ -63,15 +82,18 @@ class DualForcesHead(nn.Module):
         hidden_dim: int = 64,
         mode: str = "autograd",
         correction_weight: float = 0.1,
+        pairwise_correction_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.irreps_in: Irreps = Irreps(irreps_in)
-        if mode not in {"autograd", "direct", "hybrid"}:
+        if mode not in self._SUPPORTED_MODES:
             raise ValueError(
-                f"DualForcesHead.mode must be 'autograd', 'direct' or 'hybrid', got '{mode}'."
+                f"DualForcesHead.mode must be one of "
+                f"{sorted(self._SUPPORTED_MODES)}, got '{mode}'."
             )
         self.mode: str = mode
         self.correction_weight: float = correction_weight
+        self.pairwise_correction_weight: float = pairwise_correction_weight
 
         self.readout: ScalarReadout = ScalarReadout(
             irreps_in=self.irreps_in, hidden_dim=hidden_dim
@@ -132,6 +154,30 @@ class DualForcesHead(nn.Module):
         if self.mode == "direct":
             forces_direct: torch.Tensor = self.force_proj(features.node_feats)  # (N, 3)
             outputs["forces"] = forces_direct
+            return outputs
+
+        if self.mode == "pairwise":
+            if features.node_forces is None:
+                raise ValueError(
+                    "DualForcesHead.mode='pairwise' requires the backbone to "
+                    "populate features.node_forces (e.g. KRONOS with "
+                    "compute_pairwise_forces=True)."
+                )
+            forces_pairwise: torch.Tensor = features.node_forces  # (N, 3)
+            if self.pairwise_correction_weight > 0.0 and graph.pos.requires_grad:
+                # Combined mode: F = F_autograd + w * F_pairwise
+                grad_outputs_c: tuple[torch.Tensor, ...] = torch.autograd.grad(
+                    outputs=energy.sum(),
+                    inputs=graph.pos,
+                    create_graph=self.training,
+                    retain_graph=True,
+                )
+                forces_auto_c: torch.Tensor = -grad_outputs_c[0]
+                outputs["forces"] = (
+                    forces_auto_c + self.pairwise_correction_weight * forces_pairwise
+                )
+            else:
+                outputs["forces"] = forces_pairwise
             return outputs
 
         # autograd-based: F = -∂E/∂r

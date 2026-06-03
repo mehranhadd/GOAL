@@ -14,6 +14,9 @@ Validates:
 * **Static zero-masking schedule**: on a batch that only contains one
   pair type (C-C), every one of the nine absent experts still executes
   and contributes exactly ``0.0`` to the total energy.
+* **Data-driven routing (CHANGE 4)**: pairs below ``min_pair_frequency``
+  are routed to the shared ``RarePairExpert``; common pairs keep their
+  dedicated ``PairwiseExpert``.
 """
 
 from __future__ import annotations
@@ -28,10 +31,12 @@ from goal.ml.nn.blocks.experts import (
     ExpertConfig,
     KronosMoE,
     PairwiseExpert,
+    RarePairExpert,
     cosine_cutoff,
     enumerate_element_pairs,
     pair_label,
 )
+from tests.ml.kronos.conftest import requires_gmd
 
 
 class TestEnumerateElementPairs:
@@ -321,3 +326,229 @@ class TestZeroMaskCCOnly:
                     f"Absent expert {key} received a non-zero gradient "
                     f"({expert.gate.grad.item()!r}) — zero-masking is broken"
                 )
+
+
+# ---------------------------------------------------------------------------
+# CHANGE 4: Data-driven routing — RarePairExpert
+# ---------------------------------------------------------------------------
+
+
+class TestRarePairRouting:
+    """Tests for ``rare_pair_enabled=True`` routing in ``KronosMoE``."""
+
+    # H/C/O elements: pairs are (H-H, H-C, H-O, C-C, C-O, O-O) = 6 total.
+    # We make H-H and O-O "rare" by giving them tiny counts.
+    _ELEMENTS = (1, 6, 8)
+    _IRREPS_IN = "8x0e+8x1o"
+
+    def _pair_counts_hco(self) -> dict[tuple[int, int], int]:
+        """95% of edges are H-C, leaving H-H and O-O below 1% each."""
+        return {
+            (1, 1): 1,  # rare  (~0.09 %)
+            (1, 6): 550,  # common (~50 %)
+            (1, 8): 400,  # common (~36 %)
+            (6, 6): 150,  # common (~13.6 %)
+            (6, 8): 1,  # rare  (~0.09 %)
+            (8, 8): 1,  # rare  (~0.09 %)
+        }  # total ≈ 1103 directed edges
+
+    def _make_moe_with_routing(self) -> KronosMoE:
+        cfg = ExpertConfig(
+            scalar_channels=8,
+            hidden_dims=(16,),
+            expert_type="linear",
+            rare_pair_embed_dim=4,
+        )
+        return KronosMoE(
+            elements=self._ELEMENTS,
+            irreps_in=self._IRREPS_IN,
+            expert_config=cfg,
+            cutoff=5.0,
+            pair_counts=self._pair_counts_hco(),
+            rare_pair_enabled=True,
+            min_pair_frequency=0.01,
+        ).double()
+
+    def test_common_pairs_have_dedicated_experts(self) -> None:
+        moe = self._make_moe_with_routing()
+        # H-C, H-O, C-C are common → dedicated PairwiseExperts
+        for a, b in [(1, 6), (1, 8), (6, 6)]:
+            key = KronosMoE._key(a, b)
+            assert (
+                key in moe.experts
+            ), f"Common pair {(a,b)} should have a dedicated PairwiseExpert."
+
+    def test_rare_pairs_go_to_rare_expert(self) -> None:
+        moe = self._make_moe_with_routing()
+        rare_pairs = set(moe._rare_pairs)
+        # H-H, C-O, O-O are below 1% → handled by RarePairExpert
+        for p in [(1, 1), (6, 8), (8, 8)]:
+            assert p in rare_pairs, f"Pair {p} should be classified as rare (freq < 1%)."
+
+    def test_rare_expert_is_not_none(self) -> None:
+        moe = self._make_moe_with_routing()
+        assert moe.rare_expert is not None
+
+    def test_num_experts_dedicated_plus_one_shared(self) -> None:
+        moe = self._make_moe_with_routing()
+        n_dedicated = len(moe._dedicated_pairs)
+        # num_experts = dedicated + 1 (the shared RarePairExpert)
+        assert moe.num_experts == n_dedicated + 1
+
+    def test_forward_runs_on_hco_batch(self, methane_batch) -> None:  # noqa: ANN001
+        """Smoke test: routed MoE runs on a batch with H and C only."""
+        moe = self._make_moe_with_routing()
+        n = methane_batch.num_atoms
+        feats = torch.randn(n, Irreps(self._IRREPS_IN).dim, dtype=torch.float64)
+        energies = moe(
+            atom_features=feats,
+            atomic_numbers=methane_batch.atomic_numbers,
+            edge_index=methane_batch.edge_index,
+            edge_lengths=methane_batch.edge_weight,
+        )
+        assert energies.shape == (n,)
+        assert torch.isfinite(energies).all()
+
+    def test_rare_expert_parameters_receive_gradient(self, water_batch) -> None:
+        """Backward through a batch containing rare O-O pairs (water = O + 2H).
+
+        Water contains only H-H, H-O, and O-O pairs.  H-H and O-O are rare in
+        our pair_counts, so the rare_expert must fire — its parameters must
+        receive gradients.
+        """
+        moe = self._make_moe_with_routing()
+        n = water_batch.num_atoms
+        feats = torch.randn(n, Irreps(self._IRREPS_IN).dim, dtype=torch.float64)
+        energies = moe(
+            atom_features=feats,
+            atomic_numbers=water_batch.atomic_numbers,
+            edge_index=water_batch.edge_index,
+            edge_lengths=water_batch.edge_weight,
+        )
+        energies.sum().backward()
+
+        assert moe.rare_expert is not None
+        # The shared backbone parameters must have gotten gradients
+        backbone_grads = [
+            p.grad for name, p in moe.rare_expert.named_parameters() if p.grad is not None
+        ]
+        assert backbone_grads, (
+            "RarePairExpert parameters received no gradient — "
+            "the rare-pair path is disconnected from the autograd graph."
+        )
+
+    def test_no_routing_when_disabled(self) -> None:
+        """With rare_pair_enabled=False, all pairs get dedicated experts."""
+        cfg = ExpertConfig(
+            scalar_channels=8,
+            hidden_dims=(16,),
+            expert_type="linear",
+        )
+        moe = KronosMoE(
+            elements=self._ELEMENTS,
+            irreps_in=self._IRREPS_IN,
+            expert_config=cfg,
+            cutoff=5.0,
+            pair_counts=self._pair_counts_hco(),
+            rare_pair_enabled=False,
+        ).double()
+        assert len(moe._rare_pairs) == 0
+        assert moe.rare_expert is None
+        # K=3 → 6 pairs, all dedicated
+        assert moe.num_experts == 6
+
+    @requires_gmd
+    def test_routing_on_gmd_hco_batch(self, gmd_batch) -> None:  # noqa: ANN001
+        """Smoke test: routed MoE runs on real GMD batch (H, C, O atoms)."""
+        cfg = ExpertConfig(
+            scalar_channels=8,
+            hidden_dims=(16,),
+            expert_type="linear",
+            rare_pair_embed_dim=4,
+        )
+        # GMD O2C4H8: mostly H-C and H-H edges
+        pair_counts = {
+            (1, 1): 10,
+            (1, 6): 400,
+            (1, 8): 50,
+            (6, 6): 30,
+            (6, 8): 2,
+            (8, 8): 1,
+        }
+        moe = KronosMoE(
+            elements=(1, 6, 8),
+            irreps_in="8x0e+8x1o",
+            expert_config=cfg,
+            cutoff=5.0,
+            pair_counts=pair_counts,
+            rare_pair_enabled=True,
+            min_pair_frequency=0.05,
+        ).double()
+
+        feats = torch.randn(
+            gmd_batch.num_nodes,
+            Irreps("8x0e+8x1o").dim,
+            dtype=torch.float64,
+        )
+        energies = moe(
+            atom_features=feats,
+            atomic_numbers=gmd_batch.atomic_numbers,
+            edge_index=gmd_batch.edge_index,
+            edge_lengths=gmd_batch.edge_weight,
+        )
+        assert energies.shape == (gmd_batch.num_nodes,)
+        assert torch.isfinite(energies).all()
+
+
+class TestRarePairExpertModule:
+    """Direct unit tests for the :class:`RarePairExpert` module."""
+
+    def test_output_shape(self) -> None:
+        irreps_in = Irreps("8x0e+8x1o")
+        cfg = ExpertConfig(scalar_channels=8, hidden_dims=(16,), rare_pair_embed_dim=4)
+        expert = RarePairExpert(irreps_in, [(1, 6), (6, 8)], cfg).double()
+
+        n = 5
+        scalars_a = torch.randn(n, 8, dtype=torch.float64)
+        scalars_b = torch.randn(n, 8, dtype=torch.float64)
+        distances = torch.linspace(0.5, 4.0, n, dtype=torch.float64)
+        pair_idx = torch.zeros(n, dtype=torch.long)  # all edges are pair 0 (H-C)
+
+        out = expert(scalars_a, scalars_b, distances, pair_idx)
+        assert out.shape == (n,)
+        assert torch.isfinite(out).all()
+
+    def test_gates_are_parameters(self) -> None:
+        irreps_in = Irreps("4x0e")
+        cfg = ExpertConfig(scalar_channels=4, hidden_dims=(8,), rare_pair_embed_dim=4)
+        expert = RarePairExpert(irreps_in, [(1, 1), (8, 8)], cfg)
+        assert isinstance(expert.gates, torch.nn.Parameter)
+        assert expert.gates.shape == (2,)
+        assert expert.gates.requires_grad
+
+    def test_requires_at_least_one_pair(self) -> None:
+        irreps_in = Irreps("4x0e")
+        cfg = ExpertConfig(scalar_channels=4, hidden_dims=(8,))
+        with pytest.raises(ValueError, match="at least one pair"):
+            RarePairExpert(irreps_in, [], cfg)
+
+    def test_different_pair_idx_gives_different_output(self) -> None:
+        """Two edges with the same scalars/distance but different pair_local_idx
+        should produce different outputs (the embedding distinguishes pairs)."""
+        irreps_in = Irreps("8x0e")
+        cfg = ExpertConfig(scalar_channels=8, hidden_dims=(16,), rare_pair_embed_dim=8)
+        expert = RarePairExpert(irreps_in, [(1, 1), (8, 8)], cfg).double()
+
+        s = torch.randn(1, 8, dtype=torch.float64)
+        d = torch.tensor([1.5], dtype=torch.float64)
+        idx_0 = torch.zeros(1, dtype=torch.long)
+        idx_1 = torch.ones(1, dtype=torch.long)
+
+        with torch.no_grad():
+            out_0 = expert(s, s, d, idx_0)
+            out_1 = expert(s, s, d, idx_1)
+
+        assert not torch.allclose(out_0, out_1), (
+            "RarePairExpert returned identical outputs for different pair_local_idx — "
+            "the per-pair embedding has no effect."
+        )

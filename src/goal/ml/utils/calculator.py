@@ -128,30 +128,62 @@ class GOALCalculator(Calculator):
     ) -> tuple[typing.Any, float]:
         """Load a GOALModule from a Lightning checkpoint.
 
-        Extracts the cutoff from the saved Hydra config stored in the
-        checkpoint's ``hyper_parameters``.
+        Reconstructs backbone + head + loss from the saved Hydra config,
+        loads the state dict, and extracts the neighbour-list cutoff.
+        Lightning's ``load_from_checkpoint`` cannot be used directly because
+        backbone/head/loss are excluded from ``save_hyperparameters``.
         """
+        import torch
+
+        from goal.ml.registry import BACKBONE_REGISTRY, HEAD_REGISTRY, LOSS_REGISTRY
+        from goal.ml.training.loss import CompositeLoss, WeightedLoss
         from goal.ml.training.module import GOALModule
 
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-        module = GOALModule.load_from_checkpoint(
-            str(path),
-            map_location=self.device,
-        )
+        raw = torch.load(str(path), map_location=self.device, weights_only=False)
+        cfg = raw["hyper_parameters"]["config"]
+
+        # Rebuild backbone from saved config
+        bb_cls = BACKBONE_REGISTRY.get(cfg.model.backbone.name)
+        bb_kw = {k: v for k, v in cfg.model.backbone.items() if k != "name"}
+        backbone = bb_cls(**bb_kw)
+
+        # Rebuild head (None for monolithic models)
+        head_cfg = cfg.model.get("head", None)
+        if head_cfg is not None:
+            head_cls = HEAD_REGISTRY.get(head_cfg.name)
+            head_kw = {k: v for k, v in head_cfg.items() if k != "name"}
+            head = head_cls(**head_kw)
+        else:
+            head = None
+
+        # Rebuild loss components
+        losses: list[WeightedLoss] = []
+        for lc in cfg.training.losses:
+            loss_cls = LOSS_REGISTRY.get(lc.name)
+            fn_spec = lc.get("fn", "mse")
+            lkw = {k: v for k, v in lc.items() if k not in ("name", "weight", "fn")}
+            fn = fn_spec if isinstance(fn_spec, str) else "mse"
+            losses.append(
+                WeightedLoss(loss_cls(loss_fn=fn, **lkw), weight=lc.weight, label=lc.name)
+            )
+        loss = CompositeLoss(losses)
+
+        module = GOALModule(backbone=backbone, head=head, loss=loss, config=cfg)
+        module.load_state_dict(raw["state_dict"], strict=False)
 
         # Extract cutoff from saved config
         cutoff: float = float(
-            module.config.data.get(
+            cfg.data.get(
                 "cutoff",
-                module.config.model.backbone.get("cutoff", 5.0),
+                cfg.model.backbone.get("cutoff", 5.0),
             )
         )
         return module, cutoff
 
-    @torch.no_grad()
     def calculate(
         self,
         atoms: Atoms | None = None,
@@ -162,6 +194,10 @@ class GOALCalculator(Calculator):
 
         This method is called automatically by ASE when you access
         ``atoms.get_potential_energy()``, ``atoms.get_forces()``, etc.
+
+        Runs under ``torch.enable_grad`` so that autograd-based force heads
+        (``EnergyForcesHead``, ``DualForcesHead`` in autograd/hybrid mode)
+        can compute ``-∂E/∂r``.  Gradients are not retained after this call.
         """
         if properties is None:
             properties = self.implemented_properties
@@ -181,7 +217,8 @@ class GOALCalculator(Calculator):
         )
         graph = graph.to(self.device)
 
-        predictions: dict[str, torch.Tensor] = self._module(graph)
+        with torch.enable_grad():
+            predictions: dict[str, torch.Tensor] = self._module(graph)
 
         # Energy — scalar per structure
         if "energy" in predictions:

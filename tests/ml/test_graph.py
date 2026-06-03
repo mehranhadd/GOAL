@@ -167,8 +167,16 @@ class TestPeriodicNeighborList:
 
         assert graph.edge_index.shape[1] > 0, "No edges found in periodic structure"
 
-        # All reported edge lengths must respect the cutoff
-        assert (graph.edge_lengths <= cutoff + 1e-6).all(), "Some edge lengths exceed the cutoff"
+        # Recompute edge lengths from positions + unit_shifts so the test
+        # doesn't depend on ``from_ase`` storing them (the production path
+        # derives them in-forward; see ``AtomicGraph.edge_vectors``).
+        src, _dst = graph.edge_index
+        _ = src  # silence unused-warning; src/dst reused below
+        edge_vectors = graph.pos[graph.edge_index[1]] - graph.pos[graph.edge_index[0]]
+        if graph.unit_shifts is not None and graph.unit_shifts.abs().sum() > 0:
+            edge_vectors = edge_vectors + graph.unit_shifts.to(graph.pos.dtype) @ graph.cell[0]
+        edge_lengths = edge_vectors.norm(dim=-1)
+        assert (edge_lengths <= cutoff + 1e-6).all(), "Some edge lengths exceed the cutoff"
 
         # The cross-boundary pair must be present in both directions
         src, dst = graph.edge_index
@@ -211,7 +219,13 @@ class TestPeriodicNeighborList:
         graph = AtomicGraph.from_ase(atoms, cutoff=cutoff, neighbor_list_backend="ase")
 
         assert graph.edge_index.shape[1] > 0
-        assert (graph.edge_lengths <= cutoff + 1e-6).all()
+        # ``from_ase`` no longer stores edge_lengths; recompute from
+        # positions + unit_shifts (the production-path contract).
+        edge_vectors = graph.pos[graph.edge_index[1]] - graph.pos[graph.edge_index[0]]
+        if graph.unit_shifts is not None and graph.unit_shifts.abs().sum() > 0:
+            edge_vectors = edge_vectors + graph.unit_shifts.to(graph.pos.dtype) @ graph.cell[0]
+        edge_lengths = edge_vectors.norm(dim=-1)
+        assert (edge_lengths <= cutoff + 1e-6).all()
 
 
 class TestNvalchemiopsBackend:

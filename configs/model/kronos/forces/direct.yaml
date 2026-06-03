@@ -1,7 +1,0 @@
-# @package model.head
-# Forces predicted directly by an equivariant ``1x1o`` projection.
-# Non-conservative; can fit force labels closely but breaks
-# energy-force consistency.
-
-mode: direct
-correction_weight: 0.0

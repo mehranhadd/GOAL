@@ -28,7 +28,7 @@ dependencies = [
   "rich>=13",
   "rootutils",
   "hydra-colorlog",
-  "lmdb", "pytest>=9.0.3,<10", "ipython>=9.13.0,<10", "xonsh>=0.23.7,<0.24",
+  "lmdb", "pytest>=9.0.3,<10", "ipython>=9.13.0,<10", "xonsh>=0.23.7,<0.24", "jupyter>=1.1.1,<2", "ipykernel>=7.2.0,<8",
 ]
 
 [project.optional-dependencies]
@@ -56,7 +56,8 @@ all = ["goal[mace,fairchem,matscipy,nvalchemiops,deepspeed,tune,torchmetrics,exa
 Repository = "https://github.com/Nourollah/GOAL"
 
 [project.scripts]
-goal-train = "goal.ml.cli.train:train"
+goal-train = "goal.ml.cli.train:train_ml"
+goal-train-ml = "goal.ml.cli.train:train_ml"
 goal-eval = "goal.ml.cli.evaluate:evaluate"
 goal-finetune = "goal.ml.cli.finetune:finetune"
 goal-tune = "goal.ml.cli.tune:tune"
@@ -108,6 +109,7 @@ python = "3.14.*"
 
 [tool.pixi.pypi-dependencies]
 goal = { path = ".", editable = true }
+py3dmol = "*"
 
 # --- Platform features ---
 
@@ -122,6 +124,10 @@ platforms = ["linux-64"]
 
 [tool.pixi.feature.cuda.dependencies]
 pytorch-gpu = ">=2.10"
+
+[tool.pixi.feature.cuda.pypi-dependencies]
+jupyter = ">=1.1.1,<2"
+ipykernel = ">=6"
 
 [tool.pixi.feature.cuda.system-requirements]
 cuda = "12.0"
@@ -201,8 +207,12 @@ test-full = "pytest"
 lint = "ruff check src/ tests/"
 format = "ruff format src/ tests/"
 typecheck = "mypy src/goal/ml/"
-train = "python -m goal.ml.cli.train"
+train = "python -c 'from goal.ml.cli.train import train_ml; train_ml()'"
+train-ml = "python -c 'from goal.ml.cli.train import train_ml; train_ml()'"
 eval = "python -m goal.ml.cli.evaluate"
 finetune = "python -m goal.ml.cli.finetune"
 simulate = "python -m goal.md.cli.simulate"
 simulate-mts = "python -m goal.md.cli.simulate simulate_mts"
+
+[dependency-groups]
+cuda = ["jupyter", "ipykernel"]

@@ -35,10 +35,21 @@ class AtomicGraph(Data):
         atomic_numbers: torch.Tensor,  # (N,)   int64
         cell: torch.Tensor,  # (3, 3) float64, zeros if no PBC
         pbc: torch.Tensor,  # (3,)   bool
-        # Graph topology — always required
+        # Graph topology — only the index pairs are mandatory.
         edge_index: torch.Tensor,  # (2, E) int64
-        edge_vectors: torch.Tensor,  # (E, 3) float64, r_j - r_i
-        edge_lengths: torch.Tensor,  # (E,)   float64
+        # ``edge_vectors`` and ``edge_lengths`` are kept *optional* because
+        # the production force-prediction path (``KronosBackbone`` +
+        # ``DualForcesHead``) recomputes both from ``positions`` inside
+        # ``goal.ml.nn.models.kronos.geometry.differentiable_edges`` so the
+        # autograd chain links forces back to ``graph.pos``.  Storing them
+        # on the graph just adds ~30% per-batch VRAM with no consumer in
+        # that pipeline.  Callers that *do* need them at rest (e.g. the
+        # virial-style ``StressHead`` reading ``graph.edge_attr``
+        # directly, or downstream transforms that mutate edge geometry)
+        # may pass them explicitly — they still flow into the standard
+        # PyG slots (``edge_attr`` / ``edge_weight``).
+        edge_vectors: torch.Tensor | None = None,  # (E, 3) float, r_j - r_i
+        edge_lengths: torch.Tensor | None = None,  # (E,)   float
         # PBC shifts — integer cell-shift vectors per edge (needed by MACE/MLIPs)
         unit_shifts: torch.Tensor | None = None,  # (E, 3) int64
         # Training targets — optional, None for inference
@@ -82,14 +93,25 @@ class AtomicGraph(Data):
         return self.z
 
     @property
-    def edge_vectors(self) -> torch.Tensor:
-        """Edge displacement vectors r_j − r_i, shape (E, 3)."""
-        return self.edge_attr
+    def edge_vectors(self) -> torch.Tensor | None:
+        """Stored edge displacement vectors r_j − r_i, shape (E, 3).
+
+        ``None`` on graphs built via :meth:`from_ase` / :meth:`from_dict`
+        (the production path) — callers should recompute from
+        ``positions`` + ``edge_index`` so the autograd chain is intact.
+        Only populated when the graph was constructed explicitly with
+        ``edge_vectors=...``.
+        """
+        return self.get("edge_attr", None)
 
     @property
-    def edge_lengths(self) -> torch.Tensor:
-        """Edge lengths ‖r_j − r_i‖, shape (E,)."""
-        return self.edge_weight
+    def edge_lengths(self) -> torch.Tensor | None:
+        """Stored edge lengths ‖r_j − r_i‖, shape (E,).
+
+        ``None`` on graphs built via :meth:`from_ase` / :meth:`from_dict`
+        — see :attr:`edge_vectors` for the rationale.
+        """
+        return self.get("edge_weight", None)
 
     @property
     def energy(self) -> torch.Tensor | None:
@@ -152,14 +174,20 @@ class AtomicGraph(Data):
 
         nl = build_neighbor_list(atoms, cutoff, backend=neighbor_list_backend, dtype=dtype)
 
+        # ``nl.edge_vectors`` / ``nl.edge_lengths`` are deliberately *not*
+        # forwarded here.  Production heads recompute both from positions
+        # in the forward pass (so the autograd graph wires force gradients
+        # back to ``graph.pos``); keeping them on every graph in the
+        # dataloader just inflates per-batch VRAM with redundant data.
+        # Callers needing the stored copy (e.g. stress training before
+        # the StressHead update lands) can construct ``AtomicGraph``
+        # directly and pass them through ``__init__``.
         return cls(
             positions=positions,
             atomic_numbers=atomic_numbers,
             cell=cell,
             pbc=pbc_tensor,
             edge_index=nl.edge_index,
-            edge_vectors=nl.edge_vectors,
-            edge_lengths=nl.edge_lengths,
             unit_shifts=nl.unit_shifts,
             energy=(torch.tensor([energy], dtype=dtype) if energy is not None else None),
             forces=(torch.tensor(forces, dtype=dtype) if forces is not None else None),
@@ -195,14 +223,15 @@ class AtomicGraph(Data):
             dtype=positions.dtype,
         )
 
+        # See ``from_ase`` for why edge_vectors / edge_lengths are *not*
+        # forwarded — production heads recompute them from positions so
+        # storing them per-graph is wasted memory.
         return cls(
             positions=positions,
             atomic_numbers=atomic_numbers,
             cell=cell,
             pbc=pbc,
             edge_index=nl.edge_index,
-            edge_vectors=nl.edge_vectors,
-            edge_lengths=nl.edge_lengths,
             unit_shifts=nl.unit_shifts,
             energy=d.get("energy"),
             forces=d.get("forces"),
@@ -232,6 +261,16 @@ class NodeFeatures:
 
     node_energies: torch.Tensor | None = None
     """(N,) atomic energy contributions, if available."""
+
+    node_forces: torch.Tensor | None = None
+    """(N, 3) per-atom forces produced by a pairwise-force backbone.
+
+    When populated (e.g. by ``KronosBackbone`` with
+    ``compute_pairwise_forces=True``), force-aware heads can consume
+    these directly instead of taking an additional
+    ``autograd.grad(energy, positions)`` pass.  Newton's third law is
+    satisfied by construction whenever a backbone fills this slot.
+    """
 
 
 # ---------------------------------------------------------------------------
