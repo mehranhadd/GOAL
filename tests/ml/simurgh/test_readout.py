@@ -18,7 +18,7 @@ from e3nn.o3 import Irreps
 from torch_geometric.data import Batch
 
 from goal.ml.nn.blocks.env_dressing import EnvironmentDressing
-from tests.ml.kronos.conftest import requires_gmd
+from tests.ml.simurgh.conftest import requires_gmd
 
 # ---------------------------------------------------------------------------
 # Helpers

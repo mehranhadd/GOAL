@@ -58,6 +58,6 @@ import goal.ml.nn.heads  # noqa: F401,E402
 # call ``MODEL_REGISTRY.register_lazy(...)`` / ``HEAD_REGISTRY.register_lazy(...)``
 # / ``DATASET_REGISTRY.register_lazy(...)``.  Without these imports the
 # registries are empty and the CLIs cannot resolve names like
-# ``cfg.model.backbone.name = "kronos"``.
+# ``cfg.model.backbone.name = "simurgh"``.
 # ---------------------------------------------------------------------------
 import goal.ml.nn.models  # noqa: F401,E402

@@ -75,7 +75,7 @@ class EnergyForcesHead(nn.Module):
             ``{'energy': (B,), 'forces': (N, 3), ...}``
         """
         # Per-node scalar contribution.  Honour pre-computed energies
-        # supplied by the backbone (e.g. KRONOS) and fall back to the
+        # supplied by the backbone (e.g. SIMURGH) and fall back to the
         # scalar readout when they are absent.
         if features.node_energies is not None:
             node_energies: torch.Tensor = features.node_energies  # (N,)

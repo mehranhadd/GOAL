@@ -32,7 +32,7 @@ from torch_geometric.utils import scatter
 
 from goal.ml.data.graph import AtomicGraph
 from goal.ml.nn.blocks.embedding import AtomicNumberEmbedding
-from goal.ml.nn.blocks.experts import cosine_cutoff
+from goal.ml.nn.blocks.artisans import cosine_cutoff
 from goal.ml.nn.primitives.radial import BesselBasis
 from goal.ml.registry import BACKBONE_REGISTRY, MODEL_REGISTRY
 

@@ -2,8 +2,8 @@
 
 Covers:
   - compute_unique_elements() from statistics.py
-  - Auto-injection into KronosBackbone via train.py flow
-  - Provided-mode validation in KronosBackbone._init_atomic_energies()
+  - Auto-injection into SimurghBackbone via train.py flow
+  - Provided-mode validation in SimurghBackbone._init_atomic_energies()
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from torch_geometric.data import Batch
 
 from goal.ml.data.graph import AtomicGraph
 from goal.ml.data.statistics import compute_unique_elements
-from goal.ml.nn.models.kronos.backbone import KronosBackbone
+from goal.ml.nn.models.simurgh.backbone import SimurghBackbone
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,9 +42,9 @@ def _make_graph(atomic_numbers: list[int]) -> AtomicGraph:
     )
 
 
-def _minimal_kronos(elements: list[int], ae_mode: str, ae_values: dict | None) -> KronosBackbone:
-    """Build the smallest valid KronosBackbone for the given elements/AE config."""
-    return KronosBackbone(
+def _minimal_simurgh(elements: list[int], ae_mode: str, ae_values: dict | None) -> SimurghBackbone:
+    """Build the smallest valid SimurghBackbone for the given elements/AE config."""
+    return SimurghBackbone(
         elements=elements,
         dressing_kwargs=dict(
             embedding_dim=4,
@@ -63,7 +63,7 @@ def _minimal_kronos(elements: list[int], ae_mode: str, ae_values: dict | None) -
             agg_norm_exponent=1.0,
             num_elements=9,
         ),
-        expert_config=dict(
+        artisan_config=dict(
             scalar_channels=4,
             hidden_dims=(8,),
             expert_type="linear",
@@ -136,7 +136,7 @@ class TestProvidedModeAllCovered:
     def test_all_elements_present(self) -> None:
         """Provided mode with values for all dataset elements raises nothing."""
         # Elements in dataset: H(1), C(6)
-        _minimal_kronos(
+        _minimal_simurgh(
             elements=[1, 6],
             ae_mode="provided",
             ae_values={1: -13.6, 6: -1028.5},
@@ -145,7 +145,7 @@ class TestProvidedModeAllCovered:
     def test_extra_values_are_fine(self) -> None:
         """Having more values than elements in the dataset is allowed."""
         # Dataset has H and C, but we also provide N and O — that's fine
-        _minimal_kronos(
+        _minimal_simurgh(
             elements=[1, 6],
             ae_mode="provided",
             ae_values={1: -13.6, 6: -1028.5, 7: -1483.9, 8: -2041.1},
@@ -161,7 +161,7 @@ class TestProvidedModeMissingElement:
     def test_missing_oxygen_raises(self) -> None:
         """Provided mode with O missing from values raises ValueError with helpful message."""
         with pytest.raises(ValueError) as exc_info:
-            _minimal_kronos(
+            _minimal_simurgh(
                 elements=[1, 6, 8],
                 ae_mode="provided",
                 ae_values={1: -13.6, 6: -1028.5},  # O(8) missing
@@ -176,7 +176,7 @@ class TestProvidedModeMissingElement:
     def test_multiple_missing_elements(self) -> None:
         """Multiple missing elements are all reported in the error."""
         with pytest.raises(ValueError) as exc_info:
-            _minimal_kronos(
+            _minimal_simurgh(
                 elements=[1, 6, 7, 8],
                 ae_mode="provided",
                 ae_values={1: -13.6},  # C, N, O all missing
@@ -190,7 +190,7 @@ class TestProvidedModeMissingElement:
         # This test verifies the error is synchronous (not deferred)
         raised = False
         try:
-            _minimal_kronos(
+            _minimal_simurgh(
                 elements=[1, 6, 8],
                 ae_mode="provided",
                 ae_values={1: -13.6},  # C and O missing
@@ -210,7 +210,7 @@ class TestDatasetModeNeverRaises:
         """dataset mode with values=null raises only if we don't pre-fill."""
         # In dataset mode, train.py fills in the values before construction.
         # When values is provided (simulating post-fill), no error.
-        _minimal_kronos(
+        _minimal_simurgh(
             elements=[1, 6, 8],
             ae_mode="dataset",
             ae_values={1: -13.6, 6: -1028.5, 8: -2041.1},
@@ -220,7 +220,7 @@ class TestDatasetModeNeverRaises:
         """dataset mode never raises a coverage error regardless of which elements."""
         # Provide values only for C — in dataset mode this is fine because
         # train.py always fills all observed elements via compute_atomic_references.
-        _minimal_kronos(
+        _minimal_simurgh(
             elements=[1, 6, 8],
             ae_mode="dataset",
             ae_values={6: -1028.5},  # only C — would fail in provided mode
@@ -235,7 +235,7 @@ class TestDatasetModeNeverRaises:
 class TestLearnedModeNeverRaises:
     def test_learned_mode_any_elements(self) -> None:
         """learned mode never raises regardless of which elements are present."""
-        _minimal_kronos(
+        _minimal_simurgh(
             elements=[1, 6, 7, 8, 16],  # include S
             ae_mode="learned",
             ae_values=None,
@@ -245,7 +245,7 @@ class TestLearnedModeNeverRaises:
         """learned mode registers self.atomic_energies as an nn.Parameter."""
         import torch.nn as nn
 
-        backbone = _minimal_kronos(
+        backbone = _minimal_simurgh(
             elements=[1, 6],
             ae_mode="learned",
             ae_values=None,

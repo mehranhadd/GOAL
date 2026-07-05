@@ -9,11 +9,31 @@ Wraps any trained ``GOALModule`` checkpoint into a standard ASE
 - Nudged elastic band (NEB) transition-state searches
 - Phonon calculations (``ase.phonons``)
 
+Three checkpoint formats are accepted:
+
+A. ``.simurgh`` archive — a single self-contained zip (weights +
+   resolved config + metadata + frozen model source).  Recommended for
+   sharing and deployment; loads from the frozen source, so it works
+   even after the codebase has changed.
+B. Checkpoint *directory* written by ``GOALCheckpointManager`` — must
+   contain ``config.yaml``, ``metadata.json`` and ``frozen_source/``.
+   Select which weights to use via ``checkpoint=`` (``"best"``,
+   ``"last"``, ``"epoch=N"``, or a ``.ckpt`` filename).
+C. Bare ``.ckpt`` file (legacy) — NOT self-contained: loading rebuilds
+   the model from the *live* source code and may fail if it changed
+   since the checkpoint was saved.
+
 Usage::
 
     from goal.ml.utils.calculator import GOALCalculator
 
-    # From a checkpoint file
+    # From a self-contained archive (FORMAT A — recommended)
+    calc = GOALCalculator(checkpoint_path="my_model.simurgh")
+
+    # From a checkpoint directory (FORMAT B)
+    calc = GOALCalculator(checkpoint_path="logs/.../checkpoints", checkpoint="best")
+
+    # From a bare checkpoint file (FORMAT C — legacy)
     calc = GOALCalculator(checkpoint_path="logs/train/runs/.../last.ckpt")
 
     # From an already-loaded module
@@ -37,6 +57,8 @@ Usage::
 
 from __future__ import annotations
 
+import logging
+import tempfile
 import typing
 from pathlib import Path
 
@@ -46,6 +68,17 @@ from ase import Atoms
 from ase.calculators.calculator import Calculator, all_changes
 from ase.stress import full_3x3_to_voigt_6_stress
 
+from goal.ml.training.archive import (
+    ARCHIVE_SUFFIX,
+    FROZEN_SOURCE_DIRNAME,
+    frozen_source_imports,
+    is_managed_checkpoint_dir,
+    resolve_checkpoint,
+    unpack_simurgh_archive,
+)
+
+logger = logging.getLogger(__name__)
+
 
 class GOALCalculator(Calculator):
     """ASE Calculator backed by a trained GOAL model.
@@ -53,8 +86,9 @@ class GOALCalculator(Calculator):
     Parameters
     ----------
     checkpoint_path : str or Path, optional
-        Path to a Lightning checkpoint (``.ckpt``).  Mutually exclusive
-        with ``module``.
+        A ``.simurgh`` archive, a checkpoint directory written by
+        ``GOALCheckpointManager``, or a bare Lightning ``.ckpt`` file
+        (legacy).  Mutually exclusive with ``module``.
     module : GOALModule, optional
         An already-instantiated ``GOALModule``.  Mutually exclusive with
         ``checkpoint_path``.
@@ -71,6 +105,10 @@ class GOALCalculator(Calculator):
         match the model.  Pass an explicit dtype only to override.
     head : str or None
         Multi-head tag for models trained with multiple heads.
+    checkpoint : str
+        Which weights to load when ``checkpoint_path`` is a checkpoint
+        *directory*: ``"best"`` (default), ``"last"``, ``"epoch=N"``,
+        or a ``.ckpt`` filename/path.  Ignored for the other formats.
     **kwargs
         Forwarded to ``ase.calculators.calculator.Calculator.__init__``.
     """
@@ -89,6 +127,7 @@ class GOALCalculator(Calculator):
         device: str = "cpu",
         dtype: torch.dtype | None = None,
         head: str | None = None,
+        checkpoint: str = "best",
         **kwargs: typing.Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -100,9 +139,12 @@ class GOALCalculator(Calculator):
 
         self.device: torch.device = torch.device(device)
         self.head: str | None = head
+        self._checkpoint_selector: str = checkpoint
+        # Keeps an unpacked .simurgh archive alive for the calculator's lifetime
+        self._archive_tmpdir: tempfile.TemporaryDirectory | None = None
 
         if checkpoint_path is not None:
-            self._module, self._cutoff = self._load_checkpoint(checkpoint_path)
+            self._module, self._cutoff = self._load_model(checkpoint_path)
         else:
             if cutoff is None:
                 raise ValueError("'cutoff' is required when providing a module directly.")
@@ -122,7 +164,80 @@ class GOALCalculator(Calculator):
                 dtype = torch.float64
         self.dtype: torch.dtype = dtype
 
-    def _load_checkpoint(
+    # ------------------------------------------------------------------
+    # Loading — format dispatch
+    # ------------------------------------------------------------------
+
+    def _load_model(self, path: str | Path) -> tuple[typing.Any, float]:
+        """Dispatch on the three supported checkpoint formats."""
+        path_str = str(path)
+
+        if path_str.endswith(ARCHIVE_SUFFIX):
+            # FORMAT A — self-contained .simurgh archive
+            return self._load_from_archive(path)
+
+        if Path(path).is_dir():
+            # FORMAT B — checkpoint directory written by GOALCheckpointManager
+            dirpath = Path(path)
+            if not is_managed_checkpoint_dir(dirpath):
+                raise FileNotFoundError(
+                    f"Directory {dirpath} is missing config.yaml, metadata.json, "
+                    f"or {FROZEN_SOURCE_DIRNAME}/. This is not a valid SIMURGH "
+                    f"checkpoint directory. Pass a {ARCHIVE_SUFFIX} archive or a "
+                    f"directory produced by GOALCheckpointManager."
+                )
+            ckpt_path = resolve_checkpoint(dirpath, self._checkpoint_selector)
+            return self._load_from_directory(dirpath, ckpt_path)
+
+        if path_str.endswith(".ckpt"):
+            # FORMAT C — legacy bare checkpoint
+            logger.warning(
+                "Loading from a bare .ckpt file. This format is not "
+                "self-contained — if source files have changed since this "
+                "checkpoint was saved, loading may fail. Use a %s archive "
+                "or the checkpoint directory for reliable loading.",
+                ARCHIVE_SUFFIX,
+            )
+            return self._build_module_from_ckpt(path)
+
+        raise ValueError(
+            f"Unrecognised checkpoint path: {path}. Expected a {ARCHIVE_SUFFIX} "
+            f"archive, a checkpoint directory, or a .ckpt file."
+        )
+
+    def _load_from_archive(self, path: str | Path) -> tuple[typing.Any, float]:
+        """FORMAT A: unpack the archive and load from its frozen source."""
+        archive = Path(path)
+        if not archive.is_file():
+            raise FileNotFoundError(f"Archive not found: {archive}")
+        self._archive_tmpdir = tempfile.TemporaryDirectory(prefix="goal_simurgh_")
+        dest = unpack_simurgh_archive(archive, self._archive_tmpdir.name)
+        weights = dest / "weights.pt"
+        if not weights.is_file():
+            raise FileNotFoundError(f"Archive {archive} contains no weights.pt")
+        logger.info("Loading %s from frozen source (self-contained archive).", archive.name)
+        return self._load_from_directory(dest, weights)
+
+    def _load_from_directory(
+        self,
+        dirpath: Path,
+        ckpt_path: Path,
+    ) -> tuple[typing.Any, float]:
+        """FORMAT B: rebuild the model with imports served from frozen source."""
+        frozen = dirpath / FROZEN_SOURCE_DIRNAME
+        logger.info(
+            "Loading %s using frozen source at %s — immune to later code changes.",
+            ckpt_path.name,
+            frozen,
+        )
+        with frozen_source_imports(frozen):
+            return self._build_module_from_ckpt(ckpt_path)
+
+    # ------------------------------------------------------------------
+    # Loading — model reconstruction
+    # ------------------------------------------------------------------
+
+    def _build_module_from_ckpt(
         self,
         path: str | Path,
     ) -> tuple[typing.Any, float]:
@@ -132,9 +247,17 @@ class GOALCalculator(Calculator):
         loads the state dict, and extracts the neighbour-list cutoff.
         Lightning's ``load_from_checkpoint`` cannot be used directly because
         backbone/head/loss are excluded from ``save_hyperparameters``.
+
+        All ``goal`` imports happen inside this function so that, when it
+        runs under :func:`frozen_source_imports`, the model classes are
+        executed from the frozen snapshot instead of the live codebase.
         """
         import torch
 
+        # Populate the registries (auto-discovery walks the package path,
+        # which under a frozen import context is the frozen snapshot).
+        import goal.ml.nn.heads  # noqa: F401
+        import goal.ml.nn.models  # noqa: F401
         from goal.ml.registry import BACKBONE_REGISTRY, HEAD_REGISTRY, LOSS_REGISTRY
         from goal.ml.training.loss import CompositeLoss, WeightedLoss
         from goal.ml.training.module import GOALModule
@@ -160,17 +283,27 @@ class GOALCalculator(Calculator):
         else:
             head = None
 
-        # Rebuild loss components
-        losses: list[WeightedLoss] = []
-        for lc in cfg.training.losses:
-            loss_cls = LOSS_REGISTRY.get(lc.name)
-            fn_spec = lc.get("fn", "mse")
-            lkw = {k: v for k, v in lc.items() if k not in ("name", "weight", "fn")}
-            fn = fn_spec if isinstance(fn_spec, str) else "mse"
-            losses.append(
-                WeightedLoss(loss_cls(loss_fn=fn, **lkw), weight=lc.weight, label=lc.name)
+        # Rebuild loss components (not used for inference; skip gracefully on
+        # API mismatch between frozen source and config, e.g. when the frozen
+        # source pre-dates a new loss parameter).
+        try:
+            losses: list[WeightedLoss] = []
+            for lc in cfg.training.losses:
+                loss_cls = LOSS_REGISTRY.get(lc.name)
+                fn_spec = lc.get("fn", "mse")
+                lkw = {k: v for k, v in lc.items() if k not in ("name", "weight", "fn")}
+                fn = fn_spec if isinstance(fn_spec, str) else "mse"
+                losses.append(
+                    WeightedLoss(loss_cls(loss_fn=fn, **lkw), weight=lc.weight, label=lc.name)
+                )
+            loss = CompositeLoss(losses)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not reconstruct loss components from frozen source (%s). "
+                "Using an empty CompositeLoss — safe for inference only.",
+                exc,
             )
-        loss = CompositeLoss(losses)
+            loss = CompositeLoss([])
 
         module = GOALModule(backbone=backbone, head=head, loss=loss, config=cfg)
         module.load_state_dict(raw["state_dict"], strict=False)

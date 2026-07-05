@@ -215,7 +215,7 @@ def _build_head(cfg: DictConfig, backbone: typing.Any) -> typing.Any:
             f"Backbone '{backbone_name}' is modular (produces "
             f"NodeFeatures) and requires a task head.  Declare a "
             f"'head:' block in the model config, or switch to a "
-            f"monolithic backbone (e.g. 'kronos_monolithic', "
+            f"monolithic backbone (e.g. 'simurgh_monolithic', "
             f"'monolithic_example')."
         )
 
@@ -254,12 +254,12 @@ def _run_training(cfg: DictConfig) -> None:
         k: v for k, v in cfg.model.backbone.items() if k != "name"
     }
 
-    # Auto-extract elements from the training set for KRONOS-family backbones.
+    # Auto-extract elements from the training set for SIMURGH-family backbones.
     # This replaces any manually-specified elements list in the config —
     # the dataset is always authoritative. Other backbones (hyperspec,
     # invariant_gnn) use a fixed-size embedding table and ignore this key.
     backbone_name: str = cfg.model.backbone.name
-    if backbone_name in ("kronos", "kronos_monolithic"):
+    if backbone_name in ("simurgh", "simurgh_monolithic", "monolithic_arace"):
         elements: list[int] = compute_unique_elements(datamodule.data_train)
         symbol_str: str = " ".join(f"{ATOMIC_SYMBOLS.get(z, '?')}({z})" for z in elements)
         print(f"[stats] elements discovered in training set: {symbol_str}")
@@ -310,11 +310,11 @@ def _run_training(cfg: DictConfig) -> None:
             print(f"[stats] avg_num_neighbors={avg_nn:.4f}")
 
     # pair_counts — for data-driven expert routing.
-    # Injected when the backbone has an expert_config with rare_pair_expert.enabled=true.
-    expert_cfg_raw: typing.Any = backbone_kwargs.get("expert_config")
-    if isinstance(expert_cfg_raw, (DictConfig, dict)):
-        ecfg: dict[str, typing.Any] = dict(expert_cfg_raw)
-        ge: dict[str, typing.Any] = dict(ecfg.get("rare_pair_expert") or {})
+    # Injected when the backbone has an artisan_config with rare_artisan.enabled=true.
+    artisan_cfg_raw: typing.Any = backbone_kwargs.get("artisan_config")
+    if isinstance(artisan_cfg_raw, (DictConfig, dict)):
+        ecfg: dict[str, typing.Any] = dict(artisan_cfg_raw)
+        ge: dict[str, typing.Any] = dict(ecfg.get("rare_artisan") or {})
         if bool(ge.get("enabled", False)) and ecfg.get("pair_counts") is None:
             pc: dict[tuple[int, int], int] = compute_pair_counts(datamodule.data_train)
             total: int = max(1, sum(pc.values()))
@@ -322,7 +322,7 @@ def _run_training(cfg: DictConfig) -> None:
                 f"[stats] pair_counts computed ({len(pc)} pairs, " f"{total} total directed edges)"
             )
             ecfg["pair_counts"] = {list(k): v for k, v in pc.items()}
-            backbone_kwargs["expert_config"] = ecfg
+            backbone_kwargs["artisan_config"] = ecfg
 
     backbone: typing.Any = backbone_cls(**backbone_kwargs)
 
@@ -383,7 +383,7 @@ def _run_training(cfg: DictConfig) -> None:
     if has_model_checkpoint and has_goal_manager:
         raise ValueError(
             "Both ModelCheckpoint and GOALCheckpointManager are active simultaneously. "
-            "They conflict: use one or the other.  For KRONOS experiments use the "
+            "They conflict: use one or the other.  For SIMURGH experiments use the "
             "top-level checkpoint_manager block.  For other models use ModelCheckpoint "
             "inside callbacks:."
         )
@@ -412,13 +412,13 @@ def _run_training(cfg: DictConfig) -> None:
         (checkpoint_dir / "TRAINING_COMPLETE").touch()
 
 
-@hydra.main(version_base=None, config_path=CONFIGS_ML_DIR, config_name="kronos_gmd26")
+@hydra.main(version_base=None, config_path=CONFIGS_ML_DIR, config_name="simurgh_gmd26")
 def train_ml(cfg: DictConfig) -> None:
     """GOAL training entry point for self-contained configs/ml/ experiment files.
 
     Usage:
-        goal-train-ml                                  # loads kronos_gmd26.yaml (default)
-        goal-train-ml --config-name kronos_md17        # loads kronos_md17.yaml
+        goal-train-ml                                  # loads simurgh_gmd26.yaml (default)
+        goal-train-ml --config-name simurgh_md17        # loads simurgh_md17.yaml
         goal-train-ml --config-name hyperspec_md17     # loads hyperspec_md17.yaml
 
     All parameters live in a single file under configs/ml/.

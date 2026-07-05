@@ -1,6 +1,6 @@
 ########################################################
 # GOAL ML Experiment Configuration
-# Model  : KRONOS — E(3)-equivariant Mixture-of-Experts force field
+# Model  : SIMURGH — E(3)-equivariant artisan-bank force field
 # Dataset: MD17 aspirin (rMD17 revised split)
 #
 # Self-contained config. Every parameter the project supports is
@@ -13,12 +13,12 @@
 # EXPERIMENT METADATA
 # ─────────────────────────────────────────────────────
 experiment:
-  name: "kronos_md17"
-  description: "KRONOS on MD17 aspirin (rMD17, 950 train / 50 val)"
-  tags: ["kronos", "md17", "aspirin"]
+  name: "simurgh_md17"
+  description: "SIMURGH on MD17 aspirin (rMD17, 950 train / 50 val)"
+  tags: ["simurgh", "md17", "aspirin"]
 
 seed: 42
-task_name: "kronos_md17"
+task_name: "simurgh_md17"
 run_name_suffix: "" # optional tag, prepend "_": e.g. "_aspirin"
 run_name: ${now:%Y-%m-%d_%H-%M-%S}_${data.dataset_type}_${model.backbone.name}${run_name_suffix}
 
@@ -89,8 +89,8 @@ data:
 # MODEL
 # ─────────────────────────────────────────────────────
 # backbone.name options:
-#   "kronos", "kronos_monolithic", "hyperspec",
-#   "invariant_gnn", "monolithic_example"
+#   "simurgh", "simurgh_monolithic", "monolithic_arace",
+#   "hyperspec", "invariant_gnn", "monolithic_example"
 #
 # head.name options:
 #   "energy_forces", "dual_forces", "direct_forces",
@@ -98,7 +98,7 @@ data:
 # ─────────────────────────────────────────────────────
 model:
   backbone:
-    name: kronos
+    name: simurgh
     cutoff: ${model.backbone.dressing_kwargs.cutoff}
 
     # Atomic-energy baseline — elements are discovered automatically from
@@ -144,7 +144,7 @@ model:
       agg_norm_exponent: 1.0
       num_elements: 9
 
-    expert_config:
+    artisan_config:
       scalar_channels: 16 # narrower than GMD26
       expert_type: linear
       hidden_dims: [64, 32] # narrower than GMD26 [128, 64]
@@ -155,7 +155,7 @@ model:
       # transformer_heads: 4
       # transformer_layers: 2
 
-      rare_pair_expert:
+      rare_artisan:
         enabled: false
         min_pair_frequency: 0.01
         pair_embed_dim: 16
@@ -286,7 +286,7 @@ training:
 # CHECKPOINTING
 # ─────────────────────────────────────────────────────
 # Three independent pools: top_k, interval, last.
-# See kronos_gmd26.yaml for full documentation of all options.
+# See simurgh_gmd26.yaml for full documentation of all options.
 # ─────────────────────────────────────────────────────
 checkpoint_manager:
   _target_: goal.ml.training.callbacks.checkpoint_manager.GOALCheckpointManager
@@ -307,10 +307,14 @@ checkpoint_manager:
     enabled: true
     filename: "last.ckpt"
 
+  # Self-contained .simurgh archives — see simurgh_gmd26.yaml for docs.
+  save_archive: true
+  archive_interval: false
+
 # ─────────────────────────────────────────────────────
 # CALLBACKS
 # ─────────────────────────────────────────────────────
-# See kronos_gmd26.yaml for full documentation of all available callbacks.
+# See simurgh_gmd26.yaml for full documentation of all available callbacks.
 # ─────────────────────────────────────────────────────
 callbacks:
   rich_progress_bar:
@@ -339,7 +343,7 @@ callbacks:
 # ─────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────
-# See kronos_gmd26.yaml for full documentation of all available loggers.
+# See simurgh_gmd26.yaml for full documentation of all available loggers.
 # ─────────────────────────────────────────────────────
 logger:
   csv:
@@ -350,12 +354,12 @@ logger:
 
   # wandb:
   #   _target_: lightning.pytorch.loggers.wandb.WandbLogger
-  #   project: "goal-kronos-md17"
+  #   project: "goal-simurgh-md17"
   #   entity: null
   #   save_dir: "${paths.output_dir}"
   #   offline: false
   #   log_model: false
-  #   tags: ["kronos", "md17"]
+  #   tags: ["simurgh", "md17"]
 
   # tensorboard:
   # mlflow:
@@ -366,7 +370,7 @@ logger:
 # ─────────────────────────────────────────────────────
 # DISTRIBUTED TRAINING
 # ─────────────────────────────────────────────────────
-# See kronos_gmd26.yaml for full documentation of all strategy options.
+# See simurgh_gmd26.yaml for full documentation of all strategy options.
 # ─────────────────────────────────────────────────────
 strategy:
   name: auto
@@ -399,5 +403,5 @@ ckpt_path: null
 # ─────────────────────────────────────────────────────
 # HYPERPARAMETER SEARCH
 # ─────────────────────────────────────────────────────
-# See kronos_gmd26.yaml for full search configuration options.
+# See simurgh_gmd26.yaml for full search configuration options.
 hparams_search: null

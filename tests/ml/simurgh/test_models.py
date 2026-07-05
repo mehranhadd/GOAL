@@ -1,4 +1,4 @@
-"""End-to-end tests for the KRONOS backbone and monolithic variants.
+"""End-to-end tests for the SIMURGH backbone and monolithic variants.
 
 Coverage:
 
@@ -18,12 +18,12 @@ from torch_geometric.data import Batch
 
 from goal.ml.data.graph import AtomicGraph
 from goal.ml.nn.heads.dual_forces import DualForcesHead
-from goal.ml.nn.models.kronos import KronosBackbone, KronosMonolithic
-from tests.ml.kronos.conftest import random_so3
+from goal.ml.nn.models.simurgh import SimurghBackbone, SimurghMonolithic
+from tests.ml.simurgh.conftest import random_so3
 
 
-def _build_modular(cutoff: float = 5.0) -> tuple[KronosBackbone, DualForcesHead]:
-    backbone = KronosBackbone(
+def _build_modular(cutoff: float = 5.0) -> tuple[SimurghBackbone, DualForcesHead]:
+    backbone = SimurghBackbone(
         elements=(1, 6, 7, 8),
         dressing_kwargs={
             "num_elements": 9,
@@ -34,7 +34,7 @@ def _build_modular(cutoff: float = 5.0) -> tuple[KronosBackbone, DualForcesHead]
             "cutoff": cutoff,
             "radial_mlp_hidden": 16,
         },
-        expert_config={
+        artisan_config={
             "scalar_channels": 8,
             "hidden_dims": (32, 16),
             "expert_type": "linear",
@@ -54,8 +54,8 @@ def _build_monolithic(
     forces_mode: str = "autograd",
     correction_weight: float = 0.0,
     expert_type: str = "linear",
-) -> KronosMonolithic:
-    return KronosMonolithic(
+) -> SimurghMonolithic:
+    return SimurghMonolithic(
         elements=(1, 6, 7, 8),
         dressing_kwargs={
             "num_elements": 9,
@@ -66,7 +66,7 @@ def _build_monolithic(
             "cutoff": cutoff,
             "radial_mlp_hidden": 16,
         },
-        expert_config={
+        artisan_config={
             "scalar_channels": 8,
             "hidden_dims": (32, 16) if expert_type == "linear" else (16, 16),
             "expert_type": expert_type,
@@ -109,10 +109,10 @@ class TestMethaneSmoke:
         assert (out["forces"].abs() > 0).any().item()
         assert out["forces"].sum(dim=0).abs().max().item() < 1e-9
 
-    def test_num_experts_is_ten(self) -> None:
-        """Verify KRONOS model has 10 experts (pairs for H, C, N, O)."""
+    def test_num_artisans_is_ten(self) -> None:
+        """Verify SIMURGH model has 10 experts (pairs for H, C, N, O)."""
         model = _build_monolithic()
-        assert model.num_experts == 10
+        assert model.num_artisans == 10
         gates = model.gates()
         assert set(gates.keys()) == {
             "H-H",
@@ -129,7 +129,7 @@ class TestMethaneSmoke:
 
     @pytest.mark.parametrize("expert_type", ["linear", "transformer"])
     def test_expert_backends(self, methane_batch, expert_type: str) -> None:  # noqa: ANN001
-        """Test KRONOS works with both linear and transformer expert backends."""
+        """Test SIMURGH works with both linear and transformer expert backends."""
         model = _build_monolithic(expert_type=expert_type)
         out = model(methane_batch)
         assert torch.isfinite(out["energy"]).item()
@@ -161,7 +161,7 @@ def _rotate_batch(batch: Batch, R: torch.Tensor) -> Batch:
 class TestEquivariance:
     def _check_rotation_equivariance(
         self,
-        model: KronosMonolithic,
+        model: SimurghMonolithic,
         batch: Batch,
         atol_energy: float = 1e-5,
         atol_forces: float = 1e-5,
@@ -216,7 +216,7 @@ class TestEquivariance:
         )
 
     def test_monolithic_equivariance(self, methane_batch) -> None:  # noqa: ANN001
-        """Test rotation equivariance for monolithic KRONOS model."""
+        """Test rotation equivariance for monolithic SIMURGH model."""
         model = _build_monolithic()
         self._check_rotation_equivariance(model, methane_batch)
 

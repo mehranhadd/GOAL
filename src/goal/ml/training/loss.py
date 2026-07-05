@@ -486,14 +486,14 @@ class ChargeLoss(nn.Module):
 
 @LOSS_REGISTRY.register("gate_reg")
 class GateRegLoss(nn.Module):
-    """L2 regularisation on the MoE gate scalars.
+    """L2 regularisation on the artisan gate scalars.
 
     Penalises large gate magnitudes: ``L = sum(P_AB ** 2)`` over all
     expert gates in the batch.  The gate values are injected into the
     predictions dict by the training module under the key
     ``"gate_values"`` (a 1-D tensor of all expert gate scalars stacked).
 
-    When ``"gate_values"`` is absent from ``pred`` (e.g. for non-KRONOS
+    When ``"gate_values"`` is absent from ``pred`` (e.g. for non-SIMURGH
     models), the loss returns ``0.0`` so the same config works for all
     model families.
 

@@ -1,28 +1,34 @@
-"""KRONOS Element-Pair Mixture-of-Experts block.
+"""SIMURGH element-pair bank of potential artisans.
 
 For a configurable set of chemical elements ``E = {Z_1, ..., Z_K}`` this
-module instantiates one expert ``E_{AB}`` for every *unordered* pair of
-elements ``(A, B)`` (so ``K * (K + 1) // 2`` experts in total).  Each
-expert reads:
+module instantiates one artisan ``E_{AB}`` for every *unordered* pair of
+elements ``(A, B)`` (so ``K * (K + 1) // 2`` artisans in total).
 
-* the per-atom invariant scalars of atoms ``A`` and ``B`` (projected from
-  the dressed equivariant features via ``o3.Linear`` to a fixed
-  ``scalar_channels`` width — preserving equivariance because we keep
-  only ``l = 0`` outputs);
-* the scalar interatomic distance ``d_{ij}``.
-
-Each expert outputs a single scalar energy contribution per pair which
+Each artisan outputs a single scalar energy contribution per pair which
 is multiplied by a learnable scalar gate ``P_{AB}`` and smoothly tapered
 by a cosine cutoff envelope ``f_cut(d)`` so forces are continuous at the
 cutoff.
 
-Two expert backbones are configurable from Hydra:
+Two artisan *architectures* are configurable from Hydra
+(``architecture`` key):
 
-* ``"linear"`` — the spec described in the design document
-  (``Linear → SiLU → Linear → SiLU → Linear``).
-* ``"transformer"`` — an *equivariance-safe* mini-transformer that
-  operates exclusively on the **invariant scalar** branch, so the
-  E(3) symmetry of the model is preserved.
+* ``"scalar"`` (default) — each atom's features are projected to
+  invariant scalars (``o3.Linear`` keeping only ``l = 0`` outputs);
+  the artisan reads ``[scalars_A, scalars_B, d_ij]``.  Two scalar
+  backbones exist (``expert_type`` key):
+
+  * ``"linear"`` — ``Linear → SiLU → Linear → SiLU → Linear``;
+  * ``"transformer"`` — an *equivariance-safe* mini-transformer that
+    operates exclusively on the **invariant scalar** branch, so the
+    E(3) symmetry of the model is preserved.
+
+* ``"equivariant"`` — the artisan operates on the full equivariant
+  node features.  Both endpoints are mapped through a **shared**
+  equivariant linear and summed (symmetric by construction, so
+  ``E(A, B) = E(B, A)``), combined with the bond direction via a CG
+  tensor product weighted by a radial MLP of the bond length, and
+  finally read out through invariant scalars.  See
+  :class:`_EquivariantArtisanCore`.
 
 Static-shape zero-masking schedule
 ----------------------------------
@@ -55,9 +61,12 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from e3nn.o3 import Irreps
 
 from goal.ml.nn.primitives.linear import EquivariantLinear
+from goal.ml.nn.primitives.radial import BesselBasis, PolynomialEnvelope, RadialMLP
+from goal.ml.nn.primitives.tp import WeightedTensorProduct
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -119,17 +128,23 @@ def cosine_cutoff(distances: torch.Tensor, cutoff: float) -> torch.Tensor:
 
 
 @dataclass
-class ExpertConfig:
+class ArtisanConfig:
     """Static configuration carried by every pairwise expert.
 
     Attributes
     ----------
+    architecture : str
+        ``"scalar"`` (default — invariant-scalar artisan, original
+        behaviour) or ``"equivariant"`` (full equivariant artisan, see
+        :class:`_EquivariantArtisanCore`).
     scalar_channels : int
-        Width of the invariant projection of each atom's features.
+        Width of the invariant projection of each atom's features
+        (``"scalar"`` architecture only).
     hidden_dims : tuple of int
-        Hidden widths of the expert MLP (excluding input + output).
+        Hidden widths of the artisan MLP (excluding input + output).
     expert_type : str
-        ``"linear"`` (default) or ``"transformer"``.
+        ``"linear"`` (default) or ``"transformer"`` — scalar-architecture
+        backbone selector.
     transformer_heads : int
         Multi-head attention heads when ``expert_type == "transformer"``.
     transformer_layers : int
@@ -139,6 +154,12 @@ class ExpertConfig:
         the ``"linear"`` backbone MLP.  ``0.0`` disables dropout (default).
         ``nn.Dropout`` is used so dropout is automatically disabled during
         ``model.eval()`` / validation and inference.
+    equivariant : dict, optional
+        Sub-config for ``architecture="equivariant"`` forwarded to
+        :class:`_EquivariantArtisanCore` — keys ``hidden_irreps``,
+        ``num_layers``, ``num_rbf``, ``radial_hidden``, ``n_scalar_out``,
+        ``final_hidden``, ``element_conditioned``, ``n_elements``.
+        ``None`` uses the core's defaults.
     """
 
     scalar_channels: int = 16
@@ -147,8 +168,11 @@ class ExpertConfig:
     transformer_heads: int = 2
     transformer_layers: int = 1
     dropout_rate: float = 0.0
-    # Rare-pair expert (CHANGE 4)
+    # Rare-pair artisan (CHANGE 4)
     rare_pair_embed_dim: int = 16
+    # Artisan architecture: "scalar" (default) or "equivariant"
+    architecture: str = "scalar"
+    equivariant: dict[str, typing.Any] | None = None
 
 
 class _LinearExpert(nn.Module):
@@ -244,41 +268,302 @@ class _TransformerExpert(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Single expert wrapper
+# Equivariant artisan core
 # ---------------------------------------------------------------------------
 
 
-class PairwiseExpert(nn.Module):
-    """One ``E_{AB}`` expert for a single element pair.
+def build_artisan_edge_irreps(lmax: int) -> Irreps:
+    """Spherical-harmonics irreps for artisan edges, one channel per ``l``.
+
+    Same convention as :func:`goal.ml.nn.blocks.env_dressing.build_edge_irreps`
+    (duplicated here to keep ``blocks.artisans`` free of intra-``blocks``
+    imports): even ``l`` → parity ``e``, odd ``l`` → parity ``o``.
+    """
+    parts: list[str] = []
+    for l_val in range(lmax + 1):
+        parity: str = "e" if l_val % 2 == 0 else "o"
+        parts.append(f"1x{l_val}{parity}")
+    return Irreps("+".join(parts))
+
+
+class _PairRMSNorm(nn.Module):
+    """Smooth equivariant RMS normalisation for pair features.
+
+    Divides the whole feature vector by its global root-mean-square
+    (an invariant scalar), with one learnable gain per irrep block:
+
+        ``y_block = γ_block · x_block / sqrt(mean(x²) + ε²)``
+
+    Why not :class:`goal.ml.nn.primitives.norm.EquivariantLayerNorm`?
+    Its per-block ``x / max(‖x‖, ε)`` normalisation re-scales
+    *symmetry-suppressed* blocks (e.g. the ``l = 1`` features of an
+    atom in a tetrahedral environment, which vanish by symmetry) with
+    a gain of up to ``1/ε`` — turning numerical-cancellation residue
+    into O(1) feature noise with enormous position gradients, which
+    destroys force smoothness exactly at high-symmetry geometries.
+    The global RMS denominator is bounded away from zero by the
+    scalar channels, so this norm is smooth and well-conditioned
+    everywhere, and zero input maps to exactly zero output.
+    """
+
+    def __init__(self, irreps: Irreps | str, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.irreps: Irreps = Irreps(irreps)
+        self.eps: float = float(eps)
+        # One learnable gain per (mul, ir) block, initialised to 1.
+        self.weight: nn.Parameter = nn.Parameter(torch.ones(len(self.irreps)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``(N, irreps.dim) → (N, irreps.dim)``, equivariant."""
+        msq: torch.Tensor = x.pow(2).mean(dim=-1, keepdim=True)  # (N, 1) invariant
+        inv: torch.Tensor = torch.rsqrt(msq + self.eps**2)  # (N, 1)
+        outputs: list[torch.Tensor] = []
+        idx: int = 0
+        for block_i, (mul, ir) in enumerate(self.irreps):
+            dim: int = mul * ir.dim
+            outputs.append(x[:, idx : idx + dim] * (self.weight[block_i] * inv))
+            idx += dim
+        return torch.cat(outputs, dim=-1)
+
+
+class _EquivariantArtisanCore(nn.Module):
+    """Equivariant pairwise energy network (``architecture="equivariant"``).
+
+    Per edge ``(i → j)`` the core computes
+
+    1. **Symmetric node combination** — both endpoints' equivariant
+       features are mapped through a *shared* equivariant linear and
+       summed: ``h_AB = L(h_A) + L(h_B)``.  Sharing the map (rather
+       than using separate ``L_A`` / ``L_B``) is what makes the sum
+       genuinely symmetric, so ``E(A, B) = E(B, A)`` holds by
+       construction.
+    2. **CG tensor product with bond geometry** —
+       ``h = TP(h_AB, Y^l(r̂_ij); w(d_ij))`` where the per-edge TP
+       weights come from a radial MLP on a Bessel expansion of the
+       bond length, tapered by a polynomial envelope, and optionally
+       modulated per destination element
+       (``element_conditioned=True``).
+    3. **Optional deeper equivariant layers** — ``num_layers - 1``
+       rounds of ``h ← RMSNorm(EquivLinear(h) + h)`` using the smooth
+       :class:`_PairRMSNorm` (see its docstring for why the hard
+       per-block layer norm is unsuitable here).
+    4. **Scalar readout** — invariant ``l = 0`` scalars →
+       ``Linear → SiLU → Linear → 1``.
+
+    Every learnable map is bias-free, so a zero input produces exactly
+    zero output — required by the bank's static-shape zero-masking
+    schedule (masked edges feed zeros in and must contribute nothing).
+
+    Parameters
+    ----------
+    irreps_in : Irreps
+        Irreps of the per-atom node features fed to the artisan.
+    cutoff : float
+        Cutoff radius (Angstrom) for the radial basis and envelope.
+    hidden_irreps : str or Irreps
+        Internal equivariant width, e.g. ``"16x0e + 16x1o + 16x2e"``.
+    num_layers : int
+        Total equivariant depth; ``num_layers - 1`` residual
+        linear+norm layers follow the tensor product.
+    num_rbf : int
+        Number of Bessel radial basis functions.
+    radial_hidden : int
+        Hidden width of the radial MLP.
+    n_scalar_out : int
+        Number of invariant scalars extracted before the energy MLP.
+    final_hidden : int
+        Hidden width of the final energy MLP.
+    element_conditioned : bool
+        Modulate the radial TP weights by a per-element linear map of
+        the destination atom's element (one-hot of ``Z[col]``).
+    n_elements : int
+        One-hot vocabulary size for element conditioning.
+    """
+
+    def __init__(
+        self,
+        irreps_in: Irreps | str,
+        cutoff: float,
+        hidden_irreps: Irreps | str = "16x0e + 16x1o + 16x2e",
+        num_layers: int = 1,
+        num_rbf: int = 8,
+        radial_hidden: int = 32,
+        n_scalar_out: int = 16,
+        final_hidden: int = 16,
+        element_conditioned: bool = True,
+        n_elements: int = 120,
+    ) -> None:
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1, got {num_layers}.")
+        self.irreps_in: Irreps = Irreps(irreps_in)
+        self.irreps_hidden: Irreps = Irreps(hidden_irreps)
+        lmax: int = max((ir.l for _, ir in self.irreps_hidden), default=0)
+        self.irreps_edge: Irreps = build_artisan_edge_irreps(lmax)
+        self._element_conditioned: bool = bool(element_conditioned)
+        self._n_elements: int = int(n_elements)
+
+        # Step 1 — shared symmetric node embedding (bias-free).
+        self.node_embed: EquivariantLinear = EquivariantLinear(
+            self.irreps_in, self.irreps_hidden, biases=False
+        )
+
+        # Step 2 — CG tensor product with bond geometry.
+        self.tp: WeightedTensorProduct = WeightedTensorProduct(
+            irreps_in1=self.irreps_hidden,
+            irreps_in2=self.irreps_edge,
+            irreps_out=self.irreps_hidden,
+        )
+        self.radial_basis: BesselBasis = BesselBasis(num_basis=num_rbf, cutoff=cutoff)
+        self.envelope: PolynomialEnvelope = PolynomialEnvelope(cutoff=cutoff)
+        self.radial_mlp: RadialMLP = RadialMLP(
+            num_basis=num_rbf,
+            hidden_dim=radial_hidden,
+            num_out=self.tp.weight_numel,
+        )
+        self.element_linear: nn.Linear | None = (
+            nn.Linear(self._n_elements, self.tp.weight_numel, bias=False)
+            if element_conditioned
+            else None
+        )
+
+        # Step 3 — optional deeper equivariant layers (bias-free).
+        self.layers: nn.ModuleList = nn.ModuleList(
+            EquivariantLinear(self.irreps_hidden, self.irreps_hidden, biases=False)
+            for _ in range(num_layers - 1)
+        )
+        self.norms: nn.ModuleList = nn.ModuleList(
+            _PairRMSNorm(self.irreps_hidden) for _ in range(num_layers - 1)
+        )
+
+        # Step 4 — invariant scalar readout (bias-free).
+        scalar_irreps: Irreps = Irreps(f"{int(n_scalar_out)}x0e")
+        self.to_scalars: EquivariantLinear = EquivariantLinear(
+            self.irreps_hidden, scalar_irreps, biases=False
+        )
+        self.energy_mlp: nn.Sequential = nn.Sequential(
+            nn.Linear(int(n_scalar_out), int(final_hidden), bias=False),
+            nn.SiLU(),
+            nn.Linear(int(final_hidden), 1, bias=False),
+        )
+
+    def forward(
+        self,
+        feats_a: torch.Tensor,
+        feats_b: torch.Tensor,
+        edge_sh: torch.Tensor,
+        distances: torch.Tensor,
+        z_dst: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute per-edge invariant energies (un-gated, un-tapered).
+
+        Parameters
+        ----------
+        feats_a, feats_b : Tensor ``(E, irreps_in.dim)``
+            Equivariant node features of the source / destination atom.
+        edge_sh : Tensor ``(E, irreps_edge.dim)``
+            Spherical harmonics of the edge direction.
+        distances : Tensor ``(E,)``
+            Bond lengths.  Zeros (masked edges) are clamped to a tiny
+            positive value so the Bessel basis stays finite; the bank
+            re-masks the output, so the dummy value never contributes.
+        z_dst : Tensor ``(E,)``, optional
+            Atomic numbers of the destination atom — required when
+            ``element_conditioned=True``.
+
+        Returns
+        -------
+        Tensor ``(E,)``
+            Per-edge scalar energies.
+        """
+        h_ab: torch.Tensor = self.node_embed(feats_a) + self.node_embed(feats_b)
+
+        # Radial TP weights.  Clamp avoids 0/0 in the Bessel basis on
+        # zero-masked edges; the envelope and the bank's output mask
+        # make the clamped value irrelevant.
+        d_safe: torch.Tensor = distances.clamp_min(1e-6)
+        rbf: torch.Tensor = self.radial_basis(d_safe)  # (E, num_rbf)
+        env: torch.Tensor = self.envelope(d_safe).to(h_ab.dtype).unsqueeze(-1)  # (E, 1)
+        radial_w: torch.Tensor = self.radial_mlp(rbf) * env  # (E, weight_numel)
+
+        if self._element_conditioned and self.element_linear is not None:
+            if z_dst is None:
+                raise ValueError("element_conditioned=True requires z_dst in forward()")
+            one_hot: torch.Tensor = F.one_hot(
+                z_dst.clamp(0, self._n_elements - 1),
+                num_classes=self._n_elements,
+            ).to(radial_w.dtype)
+            radial_w = radial_w * self.element_linear(one_hot)  # (E, weight_numel)
+
+        h: torch.Tensor = self.tp(h_ab, edge_sh.to(h_ab.dtype), radial_w)
+
+        for lin, norm in zip(self.layers, self.norms):
+            h = norm(lin(h) + h)
+
+        scalars: torch.Tensor = self.to_scalars(h)  # (E, n_scalar_out)
+        return self.energy_mlp(scalars).squeeze(-1)  # (E,)
+
+
+# ---------------------------------------------------------------------------
+# Single artisan wrapper
+# ---------------------------------------------------------------------------
+
+
+class PotentialArtisan(nn.Module):
+    """One ``E_{AB}`` artisan for a single element pair.
 
     Holds:
 
-    * an invariant projection ``o3.Linear`` mapping atom features to
-      ``scalar_channels x 0e`` scalars (E(3)-safe because only ``l = 0``
-      outputs are retained);
-    * the actual expert backbone (Linear MLP or Transformer);
-    * a learnable scalar gate ``P_{AB}``.
+    * a learnable scalar gate ``P_{AB}``;
+    * for ``architecture="scalar"`` (default): an invariant projection
+      ``o3.Linear`` mapping atom features to ``scalar_channels x 0e``
+      scalars (E(3)-safe because only ``l = 0`` outputs are retained)
+      plus the scalar backbone (Linear MLP or Transformer);
+    * for ``architecture="equivariant"``: an
+      :class:`_EquivariantArtisanCore` operating on the full
+      equivariant node features and the bond direction.
     """
 
     def __init__(
         self,
         irreps_in: Irreps,
-        config: ExpertConfig,
+        config: ArtisanConfig,
+        cutoff: float = 5.0,
     ) -> None:
         super().__init__()
+        self.architecture: str = str(config.architecture)
+        if self.architecture not in ("scalar", "equivariant"):
+            raise ValueError(
+                f"Unknown architecture '{config.architecture}'. "
+                "Use 'scalar' or 'equivariant'."
+            )
         self.scalar_channels: int = config.scalar_channels
+
+        # Learnable gate, initialised to 1.0
+        self.gate: nn.Parameter = nn.Parameter(torch.tensor(1.0))
+
+        # ----- Equivariant architecture -----
+        self.equivariant_core: _EquivariantArtisanCore | None = None
+        if self.architecture == "equivariant":
+            eq_kwargs: dict[str, typing.Any] = dict(config.equivariant or {})
+            self.equivariant_core = _EquivariantArtisanCore(
+                irreps_in=irreps_in,
+                cutoff=cutoff,
+                **eq_kwargs,
+            )
+            self._backbone_type: str = "equivariant"
+            return
+
+        # ----- Scalar architecture (original behaviour) -----
         scalar_irreps: Irreps = Irreps(f"{config.scalar_channels}x0e")
 
         # Project arbitrary equivariant atom features → scalars (l=0)
         self.scalar_proj: EquivariantLinear = EquivariantLinear(irreps_in, scalar_irreps)
 
-        # Learnable gate, initialised to 1.0
-        self.gate: nn.Parameter = nn.Parameter(torch.tensor(1.0))
-
         # Backbone
         in_dim: int = 2 * config.scalar_channels + 1
         if config.expert_type == "linear":
-            self._backbone_type: str = "linear"
+            self._backbone_type = "linear"
             self.backbone: nn.Module = _LinearExpert(
                 in_dim=in_dim,
                 hidden_dims=config.hidden_dims,
@@ -298,8 +583,52 @@ class PairwiseExpert(nn.Module):
             )
 
     def project(self, atom_features: torch.Tensor) -> torch.Tensor:
-        """Invariant projection ``(N, irreps_in.dim) → (N, scalar_channels)``."""
+        """Invariant projection ``(N, irreps_in.dim) → (N, scalar_channels)``.
+
+        Scalar architecture only — the equivariant artisan consumes the
+        full node features without an invariant projection.
+        """
+        if self.architecture != "scalar":
+            raise RuntimeError(
+                "project() is only available for architecture='scalar'; "
+                "the equivariant artisan consumes full node features."
+            )
         return self.scalar_proj(atom_features)
+
+    def forward_equivariant(
+        self,
+        feats_a: torch.Tensor,
+        feats_b: torch.Tensor,
+        edge_sh: torch.Tensor,
+        distances: torch.Tensor,
+        z_dst: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute gated pair energies for ``architecture="equivariant"``.
+
+        Parameters
+        ----------
+        feats_a, feats_b : Tensor ``(P, irreps_in.dim)``
+            Equivariant node features of both endpoints.
+        edge_sh : Tensor ``(P, irreps_edge.dim)``
+            Spherical harmonics of the edge direction.
+        distances : Tensor ``(P,)``
+            Pair distances.
+        z_dst : Tensor ``(P,)``, optional
+            Destination atomic numbers (element conditioning).
+
+        Returns
+        -------
+        Tensor
+            ``(P,)`` per-pair scalar energy (gate × core output).
+        """
+        if self.equivariant_core is None:
+            raise RuntimeError(
+                "forward_equivariant() requires architecture='equivariant'."
+            )
+        raw: torch.Tensor = self.equivariant_core(
+            feats_a, feats_b, edge_sh, distances, z_dst
+        )  # (P,)
+        return self.gate * raw
 
     def forward(
         self,
@@ -307,7 +636,7 @@ class PairwiseExpert(nn.Module):
         scalars_b: torch.Tensor,
         distances: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute gated pair energies (un-tapered).
+        """Compute gated pair energies (un-tapered) — scalar architecture.
 
         Parameters
         ----------
@@ -323,6 +652,11 @@ class PairwiseExpert(nn.Module):
         Tensor
             ``(P,)`` per-pair scalar energy (gate × backbone output).
         """
+        if self.architecture != "scalar":
+            raise RuntimeError(
+                "forward() implements the scalar architecture; use "
+                "forward_equivariant() for architecture='equivariant'."
+            )
         if self._backbone_type == "linear":
             pair_features: torch.Tensor = torch.cat(  # (P, 2 * S + 1)
                 [scalars_a, scalars_b, distances.unsqueeze(-1)], dim=-1
@@ -361,6 +695,12 @@ class PairwiseExpert(nn.Module):
         tuple of Tensor
             ``(E_ij, F_ij)`` with shapes ``(P,)`` and ``(P, 3)``.
         """
+        if self.architecture != "scalar":
+            raise RuntimeError(
+                "forward_pairwise() is only implemented for "
+                "architecture='scalar'; equivariant artisans rely on the "
+                "autograd force path through graph positions."
+            )
         # Use a local leaf so the gradient stops at edge_vectors (we
         # only want the per-pair derivative, not a derivative back
         # through positions — the head can still take a separate
@@ -393,10 +733,10 @@ class PairwiseExpert(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class RarePairExpert(nn.Module):
+class RarePotentialArtisan(nn.Module):
     """Shared expert for rare/infrequent element pairs.
 
-    Unlike :class:`PairwiseExpert` — which dedicates one full MLP per pair —
+    Unlike :class:`PotentialArtisan` — which dedicates one full MLP per pair —
     this module handles *all* rare pairs in a single network by injecting a
     per-pair learned embedding.  Each rare pair gets its own
     ``pair_embed_dim``-dimensional embedding vector and its own scalar gate,
@@ -404,7 +744,7 @@ class RarePairExpert(nn.Module):
 
     The ``n_rare`` learned gate parameters and embedding rows remain in the
     autograd graph regardless of whether the corresponding pair appears in
-    the current batch (same zero-masking contract as :class:`KronosMoE`).
+    the current batch (same zero-masking contract as :class:`SimurghArtisanBank`).
 
     Parameters
     ----------
@@ -413,7 +753,7 @@ class RarePairExpert(nn.Module):
     pairs : list of (int, int)
         The rare unordered element pairs this expert handles, in canonical
         ``(lo, hi)`` order.
-    config : ExpertConfig
+    config : ArtisanConfig
         Shared expert config; ``rare_pair_embed_dim`` controls the embedding width.
     """
 
@@ -421,11 +761,11 @@ class RarePairExpert(nn.Module):
         self,
         irreps_in: Irreps,
         pairs: list[tuple[int, int]],
-        config: ExpertConfig,
+        config: ArtisanConfig,
     ) -> None:
         super().__init__()
         if not pairs:
-            raise ValueError("RarePairExpert requires at least one pair.")
+            raise ValueError("RarePotentialArtisan requires at least one pair.")
         self._pairs: tuple[tuple[int, int], ...] = tuple(pairs)
         self.scalar_channels: int = config.scalar_channels
         self._embed_dim: int = config.rare_pair_embed_dim
@@ -487,29 +827,29 @@ class RarePairExpert(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# MoE container
+# Artisan-bank container
 # ---------------------------------------------------------------------------
 
 
-class KronosMoE(nn.Module):
-    """KRONOS Element-Pair Mixture-of-Experts with optional data-driven routing.
+class SimurghArtisanBank(nn.Module):
+    """SIMURGH Element-Pair Mixture-of-Experts with optional data-driven routing.
 
-    By default, instantiates one :class:`PairwiseExpert` per unordered element
+    By default, instantiates one :class:`PotentialArtisan` per unordered element
     pair (original behaviour, ``rare_pair_enabled=False``).
 
     When ``rare_pair_enabled=True`` and ``pair_counts`` is provided, pairs whose
     frequency (fraction of total edges) falls below ``min_pair_frequency`` are
-    routed to a single shared :class:`RarePairExpert` that uses a learned
+    routed to a single shared :class:`RarePotentialArtisan` that uses a learned
     pair-type embedding to distinguish them.  Common pairs still get their own
-    dedicated :class:`PairwiseExpert`.  A routing summary is logged at init.
+    dedicated :class:`PotentialArtisan`.  A routing summary is logged at init.
 
     Parameters
     ----------
     elements : sequence of int
         Atomic numbers covered by the model.
     irreps_in : Irreps or str
-        Irreps of the per-atom features fed into the MoE.
-    expert_config : ExpertConfig
+        Irreps of the per-atom features fed into the artisan bank.
+    artisan_config : ArtisanConfig
         Config shared by all expert modules.
     cutoff : float
         Cosine-cutoff radius (Angstrom) applied to each pair energy.
@@ -519,10 +859,10 @@ class KronosMoE(nn.Module):
     rare_pair_enabled : bool
         When ``True`` and ``pair_counts`` is provided, apply frequency-based
         routing.  Pairs below ``min_pair_frequency`` go to
-        :class:`RarePairExpert`.
+        :class:`RarePotentialArtisan`.
     min_pair_frequency : float
         Minimum fraction of total edges for a pair to get a dedicated expert.
-        Pairs below this threshold are handled by :class:`RarePairExpert`.
+        Pairs below this threshold are handled by :class:`RarePotentialArtisan`.
     pair_symbols : optional mapping
         Optional override for the pretty pair labels.  Purely cosmetic.
 
@@ -538,7 +878,7 @@ class KronosMoE(nn.Module):
         self,
         elements: typing.Sequence[int],
         irreps_in: Irreps | str,
-        expert_config: ExpertConfig,
+        artisan_config: ArtisanConfig,
         cutoff: float = 5.0,
         pair_counts: typing.Mapping[tuple[int, int], int] | None = None,
         rare_pair_enabled: bool = False,
@@ -577,18 +917,29 @@ class KronosMoE(nn.Module):
         self._dedicated_pairs: tuple[tuple[int, int], ...] = tuple(dedicated_pairs)
         self._rare_pairs: tuple[tuple[int, int], ...] = tuple(rare_pairs)
 
-        # Build dedicated experts
-        experts: dict[str, PairwiseExpert] = {}
+        # Artisan architecture ("scalar" or "equivariant") — uniform
+        # across the bank; validated by the first PotentialArtisan.
+        self._architecture: str = str(artisan_config.architecture)
+
+        # Build dedicated artisans
+        artisans: dict[str, PotentialArtisan] = {}
         self._pair_keys: list[str] = []
         for a, b in self._dedicated_pairs:
             key: str = self._key(a, b)
             self._pair_keys.append(key)
-            experts[key] = PairwiseExpert(self._irreps_in, expert_config)
-        self.experts: nn.ModuleDict = nn.ModuleDict(experts)
+            artisans[key] = PotentialArtisan(self._irreps_in, artisan_config, cutoff=cutoff)
+        self.artisans: nn.ModuleDict = nn.ModuleDict(artisans)
+
+        # Edge SH irreps shared by all equivariant artisans (None for scalar).
+        self._irreps_edge: Irreps | None = None
+        if self._architecture == "equivariant" and self._pair_keys:
+            first = typing.cast(PotentialArtisan, self.artisans[self._pair_keys[0]])
+            assert first.equivariant_core is not None
+            self._irreps_edge = first.equivariant_core.irreps_edge
 
         # Build shared rare-pair expert (None when no rare pairs)
-        self.rare_expert: RarePairExpert | None = (
-            RarePairExpert(self._irreps_in, list(rare_pairs), expert_config)
+        self.rare_artisan_module: RarePotentialArtisan | None = (
+            RarePotentialArtisan(self._irreps_in, list(rare_pairs), artisan_config)
             if rare_pairs
             else None
         )
@@ -627,9 +978,9 @@ class KronosMoE(nn.Module):
             from rich.console import Console
             from rich.table import Table
 
-            console = Console()
+            
             table = Table(
-                title="[bold cyan]KRONOS Expert Routing[/bold cyan]",
+                title="[bold cyan]SIMURGH Artisan Routing[/bold cyan]",
                 show_header=True,
                 header_style="bold magenta",
             )
@@ -649,9 +1000,9 @@ class KronosMoE(nn.Module):
 
                 is_rare = (a, b) in self._rare_pairs
                 if is_rare:
-                    routing = f"[yellow]→ RarePairExpert[/yellow]"
+                    routing = "[yellow]→ RarePotentialArtisan[/yellow]"
                 else:
-                    routing = "[green]PairwiseExpert (dedicated)[/green]"
+                    routing = "[green]PotentialArtisan (dedicated)[/green]"
                 table.add_row(lbl, str(cnt), freq_str, routing)
 
             import io
@@ -662,7 +1013,7 @@ class KronosMoE(nn.Module):
 
         except ImportError:
             # Plain-text fallback
-            lines: list[str] = ["KRONOS Expert Routing:"]
+            lines: list[str] = ["SIMURGH Artisan Routing:"]
             lines.append(f"  {'Pair':<10} {'Count':>8} {'Freq':>8}  Routing")
             lines.append("  " + "-" * 50)
             for a, b in self._pairs:
@@ -674,7 +1025,7 @@ class KronosMoE(nn.Module):
                     freq = cnt / total_edges
                     freq_str = f"{freq*100:.2f}%"
                 is_rare = (a, b) in self._rare_pairs
-                routing = "→ RarePairExpert" if is_rare else "PairwiseExpert (dedicated)"
+                routing = "→ RarePotentialArtisan" if is_rare else "PotentialArtisan (dedicated)"
                 lines.append(f"  {lbl:<10} {cnt:>8} {freq_str:>8}  {routing}")
             lines.append("")
             rank_zero_info("\n".join(lines))
@@ -684,13 +1035,13 @@ class KronosMoE(nn.Module):
         n_rare = len(self._rare_pairs)
         if n_rare > 0:
             rank_zero_info(
-                f"[KRONOS MoE] {n_dedicated} dedicated PairwiseExperts | "
-                f"{n_rare} rare pair(s) handled by RarePairExpert: "
+                f"[SIMURGH ArtisanBank] {n_dedicated} dedicated PotentialArtisans | "
+                f"{n_rare} rare pair(s) handled by RarePotentialArtisan: "
                 f"{', '.join(rare_labels)}"
             )
         else:
             rank_zero_info(
-                f"[KRONOS MoE] {n_dedicated} dedicated PairwiseExperts "
+                f"[SIMURGH ArtisanBank] {n_dedicated} dedicated PotentialArtisans "
                 f"(no rare-pair routing active)"
             )
 
@@ -703,9 +1054,9 @@ class KronosMoE(nn.Module):
         return self._elements
 
     @property
-    def num_experts(self) -> int:
+    def num_artisans(self) -> int:
         """Total number of expert modules (dedicated + 1 shared if rare pairs exist)."""
-        return len(self._dedicated_pairs) + (1 if self.rare_expert is not None else 0)
+        return len(self._dedicated_pairs) + (1 if self.rare_artisan_module is not None else 0)
 
     @property
     def pairs(self) -> tuple[tuple[int, int], ...]:
@@ -718,21 +1069,22 @@ class KronosMoE(nn.Module):
     def gates(self) -> dict[str, torch.Tensor]:
         """Return a dict ``{pair_label: gate_value}`` for logging."""
         result: dict[str, torch.Tensor] = {
-            self.pair_label(a, b): self.experts[self._key(a, b)].gate.detach()
+            self.pair_label(a, b): self.artisans[self._key(a, b)].gate.detach()
             for a, b in self._dedicated_pairs
         }
-        if self.rare_expert is not None:
+        if self.rare_artisan_module is not None:
             for local_idx, (a, b) in enumerate(self._rare_pairs):
-                result[self.pair_label(a, b)] = self.rare_expert.gates[local_idx].detach()
+                result[self.pair_label(a, b)] = self.rare_artisan_module.gates[local_idx].detach()
         return result
 
     @torch.no_grad()
-    def compute_expert_loads(
+    def compute_artisan_loads(
         self,
         atom_features: torch.Tensor,
         atomic_numbers: torch.Tensor,
         edge_index: torch.Tensor,
         edge_lengths: torch.Tensor,
+        edge_vectors: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute mean absolute energy contribution per expert over a batch.
 
@@ -747,7 +1099,7 @@ class KronosMoE(nn.Module):
         dict
             ``{pair_label: scalar_tensor}`` of per-expert loads (detached).
             Also includes ``"load_variance"`` — the coefficient of variation
-            ``std(loads) / mean(loads)`` across all experts.  A value > 2.0
+            ``std(loads) / mean(loads)`` across all artisans.  A value > 2.0
             indicates expert collapse.  When E == 0 all loads are 0 and
             ``load_variance`` is 0.
         """
@@ -771,18 +1123,43 @@ class KronosMoE(nn.Module):
         z_lo: torch.Tensor = torch.minimum(z_row, z_col)
         z_hi: torch.Tensor = torch.maximum(z_row, z_col)
 
+        equivariant: bool = self._architecture == "equivariant"
+        edge_sh: torch.Tensor | None = None
+        if equivariant and self._irreps_edge is not None:
+            if edge_vectors is None:
+                raise ValueError(
+                    "architecture='equivariant' requires edge_vectors in "
+                    "compute_artisan_loads()."
+                )
+            from e3nn.o3 import spherical_harmonics
+
+            edge_sh = spherical_harmonics(
+                self._irreps_edge,
+                edge_vectors.to(dtype),
+                normalize=True,
+                normalization="component",
+            )
+
         load_values: list[torch.Tensor] = []
         for (a, b), key in zip(self._pairs, self._pair_keys):
-            expert = typing.cast(PairwiseExpert, self.experts[key])
+            expert = typing.cast(PotentialArtisan, self.artisans[key])
             mask: torch.Tensor = ((z_lo == a) & (z_hi == b)).to(dtype)
             mask_col = mask.unsqueeze(-1)
 
-            scalars: torch.Tensor = expert.project(atom_features)
-            scalars_a: torch.Tensor = scalars[row] * mask_col
-            scalars_b: torch.Tensor = scalars[col] * mask_col
-            dist_in: torch.Tensor = edge_lengths_dt * mask
-
-            pair_e: torch.Tensor = expert(scalars_a, scalars_b, dist_in)
+            if equivariant:
+                feats_a: torch.Tensor = atom_features[row] * mask_col
+                feats_b: torch.Tensor = atom_features[col] * mask_col
+                sh_in: torch.Tensor = typing.cast(torch.Tensor, edge_sh) * mask_col
+                dist_in: torch.Tensor = edge_lengths_dt * mask
+                pair_e: torch.Tensor = expert.forward_equivariant(
+                    feats_a, feats_b, sh_in, dist_in, z_col
+                )
+            else:
+                scalars: torch.Tensor = expert.project(atom_features)
+                scalars_a: torch.Tensor = scalars[row] * mask_col
+                scalars_b: torch.Tensor = scalars[col] * mask_col
+                dist_in = edge_lengths_dt * mask
+                pair_e = expert(scalars_a, scalars_b, dist_in)
             tapered: torch.Tensor = pair_e * mask * cut_env
             load: torch.Tensor = tapered.abs().mean()
             result[self.pair_label(a, b)] = load
@@ -803,17 +1180,19 @@ class KronosMoE(nn.Module):
         atomic_numbers: torch.Tensor,
         edge_index: torch.Tensor,
         edge_lengths: torch.Tensor,
+        edge_vectors: torch.Tensor | None = None,
         return_per_pair: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Compute per-atom scalar energy contributions.
 
         Static-shape schedule:
 
-        1. For every expert build a per-edge **float** mask selecting
+        1. For every artisan build a per-edge **float** mask selecting
            edges of its pair type.
-        2. Multiply the (scalar, distance) inputs by the mask *before*
-           the forward.
-        3. Multiply the expert output by the mask *again* before adding
+        2. Multiply the inputs (scalars and distance for the scalar
+           architecture; node features, edge SH and distance for the
+           equivariant architecture) by the mask *before* the forward.
+        3. Multiply the artisan output by the mask *again* before adding
            to ``atom_energies`` — non-matching edges contribute
            **exactly** ``0.0`` to the total energy.
 
@@ -828,6 +1207,10 @@ class KronosMoE(nn.Module):
             Edge index ``(2, E)``.
         edge_lengths : Tensor
             Pair distances ``(E,)``.
+        edge_vectors : Tensor, optional
+            Edge displacement vectors ``(E, 3)``.  Required when the
+            bank uses ``architecture="equivariant"`` (spherical
+            harmonics of the bond direction); ignored otherwise.
         return_per_pair : bool
             If ``True``, return ``(atom_energies, per_pair_total_energy)``
             where ``per_pair_total_energy`` is a dict keyed by
@@ -847,6 +1230,12 @@ class KronosMoE(nn.Module):
         row, col = edge_index  # both shape (E,)
         E: int = int(edge_lengths.shape[0])
 
+        equivariant: bool = self._architecture == "equivariant"
+        if equivariant and edge_vectors is None and E > 0:
+            raise ValueError(
+                "architecture='equivariant' requires edge_vectors in forward()."
+            )
+
         # Boundary cast: align edge_lengths with the per-atom feature dtype
         # so the downstream concat in ``_LinearExpert`` (scalars ⊕ distance)
         # and the per-edge mask multiplication stay in a single precision.
@@ -854,9 +1243,9 @@ class KronosMoE(nn.Module):
         edge_lengths = edge_lengths.to(dtype)
 
         # Accumulator for per-atom interaction energy.  The per-element
-        # baseline lives on the ``KronosBackbone`` as a fixed buffer
+        # baseline lives on the ``SimurghBackbone`` as a fixed buffer
         # (``atomic_energies``, computed from data via least-squares
-        # regression) and is added there — the MoE only models the
+        # regression) and is added there — the artisan bank only models the
         # local interaction residual.
         atom_energies: torch.Tensor = torch.zeros(num_atoms, device=device, dtype=dtype)
         per_pair_total: dict[str, torch.Tensor] = {}
@@ -866,27 +1255,39 @@ class KronosMoE(nn.Module):
             # Keep every expert in the autograd graph via a zero-contribution dummy.
             first_key: str = self._pair_keys[0] if self._pair_keys else ""
             scalar_channels: int = (
-                self.experts[first_key].scalar_channels
+                self.artisans[first_key].scalar_channels
                 if first_key
-                else (self.rare_expert.scalar_channels if self.rare_expert else 1)
+                else (self.rare_artisan_module.scalar_channels if self.rare_artisan_module else 1)
             )
             dummy_scalars: torch.Tensor = torch.zeros(
                 1, scalar_channels, device=device, dtype=dtype
             )
             dummy_dist: torch.Tensor = torch.zeros(1, device=device, dtype=dtype)
+            dummy_feats: torch.Tensor | None = None
+            dummy_sh: torch.Tensor | None = None
+            dummy_z: torch.Tensor | None = None
+            if equivariant and self._irreps_edge is not None:
+                dummy_feats = torch.zeros(1, self._irreps_in.dim, device=device, dtype=dtype)
+                dummy_sh = torch.zeros(1, self._irreps_edge.dim, device=device, dtype=dtype)
+                dummy_z = torch.zeros(1, dtype=torch.long, device=device)
             for (a, b), key in zip(self._dedicated_pairs, self._pair_keys):
-                expert = typing.cast(PairwiseExpert, self.experts[key])
-                _ = expert.project(atom_features)
-                dummy_out: torch.Tensor = expert(dummy_scalars, dummy_scalars, dummy_dist)
+                expert = typing.cast(PotentialArtisan, self.artisans[key])
+                if equivariant:
+                    dummy_out: torch.Tensor = expert.forward_equivariant(
+                        dummy_feats, dummy_feats, dummy_sh, dummy_dist, dummy_z
+                    )
+                else:
+                    _ = expert.project(atom_features)
+                    dummy_out = expert(dummy_scalars, dummy_scalars, dummy_dist)
                 atom_energies = atom_energies + 0.0 * dummy_out.sum()
                 if return_per_pair:
                     per_pair_total[self.pair_label(a, b)] = torch.zeros(
                         (), device=device, dtype=dtype
                     )
-            if self.rare_expert is not None:
-                _ = self.rare_expert.project(atom_features)
+            if self.rare_artisan_module is not None:
+                _ = self.rare_artisan_module.project(atom_features)
                 dummy_idx: torch.Tensor = torch.zeros(1, dtype=torch.long, device=device)
-                dummy_re: torch.Tensor = self.rare_expert(
+                dummy_re: torch.Tensor = self.rare_artisan_module(
                     dummy_scalars, dummy_scalars, dummy_dist, dummy_idx
                 )
                 atom_energies = atom_energies + 0.0 * dummy_re.sum()
@@ -905,24 +1306,46 @@ class KronosMoE(nn.Module):
         z_lo: torch.Tensor = torch.minimum(z_row, z_col)
         z_hi: torch.Tensor = torch.maximum(z_row, z_col)
 
+        # Edge spherical harmonics — geometry only, computed once and
+        # shared by every equivariant artisan in the bank.
+        edge_sh: torch.Tensor | None = None
+        if equivariant and self._irreps_edge is not None:
+            from e3nn.o3 import spherical_harmonics
+
+            edge_sh = spherical_harmonics(  # (E, irreps_edge.dim)
+                self._irreps_edge,
+                typing.cast(torch.Tensor, edge_vectors).to(dtype),
+                normalize=True,
+                normalization="component",
+            )
+
         # ---- Dedicated pair loop ----
         for (a, b), key in zip(self._dedicated_pairs, self._pair_keys):
-            expert = typing.cast(PairwiseExpert, self.experts[key])
+            expert = typing.cast(PotentialArtisan, self.artisans[key])
             mask: torch.Tensor = ((z_lo == a) & (z_hi == b)).to(dtype)
             mask_col: torch.Tensor = mask.unsqueeze(-1)
-            scalars: torch.Tensor = expert.project(atom_features)
-            scalars_a: torch.Tensor = scalars[row] * mask_col
-            scalars_b: torch.Tensor = scalars[col] * mask_col
-            dist_in: torch.Tensor = edge_lengths * mask
-            pair_e: torch.Tensor = expert(scalars_a, scalars_b, dist_in)
+            if equivariant:
+                feats_a: torch.Tensor = atom_features[row] * mask_col
+                feats_b: torch.Tensor = atom_features[col] * mask_col
+                sh_in: torch.Tensor = typing.cast(torch.Tensor, edge_sh) * mask_col
+                dist_in: torch.Tensor = edge_lengths * mask
+                pair_e: torch.Tensor = expert.forward_equivariant(
+                    feats_a, feats_b, sh_in, dist_in, z_col
+                )
+            else:
+                scalars: torch.Tensor = expert.project(atom_features)
+                scalars_a: torch.Tensor = scalars[row] * mask_col
+                scalars_b: torch.Tensor = scalars[col] * mask_col
+                dist_in = edge_lengths * mask
+                pair_e = expert(scalars_a, scalars_b, dist_in)
             tapered: torch.Tensor = pair_e * mask * cut_env
             atom_energies = atom_energies.index_add(0, row, 0.5 * tapered)
             if return_per_pair:
                 per_pair_total[self.pair_label(a, b)] = 0.5 * tapered.sum().detach()
 
-        # ---- Rare pairs via shared RarePairExpert ----
-        if self.rare_expert is not None:
-            rare_scalars: torch.Tensor = self.rare_expert.project(atom_features)  # (N, S)
+        # ---- Rare pairs via shared RarePotentialArtisan ----
+        if self.rare_artisan_module is not None:
+            rare_scalars: torch.Tensor = self.rare_artisan_module.project(atom_features)  # (N, S)
             for local_idx, (a, b) in enumerate(self._rare_pairs):
                 mask = ((z_lo == a) & (z_hi == b)).to(dtype)
                 mask_col = mask.unsqueeze(-1)
@@ -930,7 +1353,7 @@ class KronosMoE(nn.Module):
                 sb: torch.Tensor = rare_scalars[col] * mask_col
                 di: torch.Tensor = edge_lengths * mask
                 pidx: torch.Tensor = torch.full((E,), local_idx, dtype=torch.long, device=device)
-                pair_e = self.rare_expert(sa, sb, di, pidx)
+                pair_e = self.rare_artisan_module(sa, sb, di, pidx)
                 tapered = pair_e * mask * cut_env
                 atom_energies = atom_energies.index_add(0, row, 0.5 * tapered)
                 if return_per_pair:
@@ -951,8 +1374,8 @@ class KronosMoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute per-atom energies AND per-atom forces via pairwise mode.
 
-        Each :class:`PairwiseExpert` produces ``(E_ij, F_ij)`` with
-        ``F_ij = -∂E_ij/∂r_ij`` via autograd; the MoE applies the
+        Each :class:`PotentialArtisan` produces ``(E_ij, F_ij)`` with
+        ``F_ij = -∂E_ij/∂r_ij`` via autograd; the artisan bank applies the
         per-pair mask and cosine-cutoff envelope and scatter-sums to
         atoms with Newton's third law (``+0.5 F`` to row, ``-0.5 F``
         to col).  The factor of ``0.5`` accounts for the bidirectional
@@ -966,6 +1389,12 @@ class KronosMoE(nn.Module):
             ``(N, 3)``.  Newton's third law: ``sum_i F_i ≡ 0`` per
             molecule by construction.
         """
+        if self._architecture != "scalar":
+            raise RuntimeError(
+                "forward_pairwise() is only implemented for "
+                "architecture='scalar'; use the autograd force path for "
+                "equivariant artisans."
+            )
         num_atoms: int = atom_features.shape[0]
         device: torch.device = atom_features.device
         dtype: torch.dtype = atom_features.dtype
@@ -976,27 +1405,27 @@ class KronosMoE(nn.Module):
         atom_energies: torch.Tensor = torch.zeros(num_atoms, device=device, dtype=dtype)
         atom_forces: torch.Tensor = torch.zeros((num_atoms, 3), device=device, dtype=dtype)
 
-        # Degenerate case: keep all experts in the autograd graph.
+        # Degenerate case: keep all artisans in the autograd graph.
         if E == 0:
             first_key: str = self._pair_keys[0] if self._pair_keys else ""
             scalar_channels: int = (
-                self.experts[first_key].scalar_channels
+                self.artisans[first_key].scalar_channels
                 if first_key
-                else (self.rare_expert.scalar_channels if self.rare_expert else 1)
+                else (self.rare_artisan_module.scalar_channels if self.rare_artisan_module else 1)
             )
             dummy_scalars: torch.Tensor = torch.zeros(
                 1, scalar_channels, device=device, dtype=dtype
             )
             dummy_dist: torch.Tensor = torch.zeros(1, device=device, dtype=dtype)
             for _, key in zip(self._dedicated_pairs, self._pair_keys):
-                expert = typing.cast(PairwiseExpert, self.experts[key])
+                expert = typing.cast(PotentialArtisan, self.artisans[key])
                 _ = expert.project(atom_features)
                 dummy_out: torch.Tensor = expert(dummy_scalars, dummy_scalars, dummy_dist)
                 atom_energies = atom_energies + 0.0 * dummy_out.sum()
-            if self.rare_expert is not None:
-                _ = self.rare_expert.project(atom_features)
+            if self.rare_artisan_module is not None:
+                _ = self.rare_artisan_module.project(atom_features)
                 dummy_idx_re: torch.Tensor = torch.zeros(1, dtype=torch.long, device=device)
-                dummy_re: torch.Tensor = self.rare_expert(
+                dummy_re: torch.Tensor = self.rare_artisan_module(
                     dummy_scalars, dummy_scalars, dummy_dist, dummy_idx_re
                 )
                 atom_energies = atom_energies + 0.0 * dummy_re.sum()
@@ -1014,7 +1443,7 @@ class KronosMoE(nn.Module):
 
         # ---- Dedicated pair loop ----
         for (a, b), key in zip(self._dedicated_pairs, self._pair_keys):
-            expert = typing.cast(PairwiseExpert, self.experts[key])
+            expert = typing.cast(PotentialArtisan, self.artisans[key])
             mask: torch.Tensor = ((z_lo == a) & (z_hi == b)).to(dtype)
             mask_v: torch.Tensor = mask.unsqueeze(-1)
             scalars: torch.Tensor = expert.project(atom_features)
@@ -1027,11 +1456,11 @@ class KronosMoE(nn.Module):
             atom_forces = atom_forces.index_add(0, row, 0.5 * tapered_f)
             atom_forces = atom_forces.index_add(0, col, -0.5 * tapered_f)
 
-        # ---- Rare pairs via shared RarePairExpert (energy only, no pairwise forces) ----
-        # RarePairExpert doesn't implement forward_pairwise; use regular forward
+        # ---- Rare pairs via shared RarePotentialArtisan (energy only, no pairwise forces) ----
+        # RarePotentialArtisan doesn't implement forward_pairwise; use regular forward
         # and let the backbone's autograd head derive forces from positions.
-        if self.rare_expert is not None:
-            rare_scalars: torch.Tensor = self.rare_expert.project(atom_features)
+        if self.rare_artisan_module is not None:
+            rare_scalars: torch.Tensor = self.rare_artisan_module.project(atom_features)
             for local_idx, (a, b) in enumerate(self._rare_pairs):
                 mask = ((z_lo == a) & (z_hi == b)).to(dtype)
                 mask_col_re = mask.unsqueeze(-1)
@@ -1041,7 +1470,7 @@ class KronosMoE(nn.Module):
                 pidx_re: torch.Tensor = torch.full(
                     (E,), local_idx, dtype=torch.long, device=device
                 )
-                pair_e_re: torch.Tensor = self.rare_expert(sa_re, sb_re, di_re, pidx_re)
+                pair_e_re: torch.Tensor = self.rare_artisan_module(sa_re, sb_re, di_re, pidx_re)
                 tapered_re: torch.Tensor = pair_e_re * mask * cut_env
                 atom_energies = atom_energies.index_add(0, row, 0.5 * tapered_re)
 

@@ -43,7 +43,7 @@ class EquivariantInteractionBlock(nn.Module):
         ``scale = 1 / N̄^exponent``.
 
         * ``1.0`` (default) — divide by ``N̄``, matching MACE exactly.
-        * ``0.5`` — divide by ``sqrt(N̄)``, the original KRONOS behaviour.
+        * ``0.5`` — divide by ``sqrt(N̄)``, the original SIMURGH behaviour.
 
         Ignored when ``avg_num_neighbors`` is ``None``.
     element_conditioned : bool, optional

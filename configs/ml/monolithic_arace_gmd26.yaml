@@ -1,6 +1,9 @@
 ########################################################
 # GOAL ML Experiment Configuration
-# Model  : KRONOS — E(3)-equivariant Mixture-of-Experts force field
+# Model  : SIMURGH ARACE (ARtisan + Atomic Cluster Expansion) —
+#          monolithic variant alternating equivariant pair artisans
+#          with ACE message passing
+#          (see goal.ml.nn.models.simurgh.arace)
 # Dataset: GMD-26 FragmentDuplication (O₂CₙH₂ₙ, PBE/def2-SVP DFT)
 #
 # Self-contained config. Every parameter the project supports is
@@ -13,19 +16,19 @@
 # EXPERIMENT METADATA
 # ─────────────────────────────────────────────────────
 experiment:
-  name: "kronos_gmd_fd"
-  description: "KRONOS on GMD-26 FragmentDuplication (HCO elements)"
-  tags: ["kronos", "gmd", "fragment_duplication"]
+  name: "monolithic_arace_gmd26"
+  description: "SIMURGH ARACE on GMD-26 FragmentDuplication (HCO elements)"
+  tags: ["simurgh", "arace", "gmd", "fragment_duplication"]
 
 seed: 42
 
 # task_name: used by Hydra to namespace the output directory.
 # Log dir = {paths.log_dir}/{task_name}/runs/{run_name}
-task_name: "kronos_gmd_fd"
+task_name: "monolithic_arace_gmd26"
 
 # run_name_suffix: optional descriptive tag appended to the run name.
 # null or "" → no suffix; any string → appended with "_".
-# Example: "fragment_duplication" → 2026-06-02_18-30_trajectory_kronos_fragment_duplication
+# Example: "fragment_duplication" → 2026-06-02_18-30_trajectory_simurgh_fragment_duplication
 run_name_suffix: "_fragment_duplication" # prepend "_"; set to "" for no suffix
 
 # run_name: leaf of the log directory AND the W&B run name — always in sync.
@@ -131,8 +134,10 @@ data:
 # MODEL
 # ─────────────────────────────────────────────────────
 # backbone.name options:
-#   "kronos"             — E(3)-equivariant MoE force field (this file)
-#   "kronos_monolithic"  — KRONOS without backbone/head split (inference)
+#   "monolithic_arace"   — SIMURGH ARACE: artisans + ACE alternating,
+#                          monolithic (this file)
+#   "simurgh"             — E(3)-equivariant artisan-bank force field
+#   "simurgh_monolithic"  — SIMURGH without backbone/head split (inference)
 #   "hyperspec"          — E(3)-equivariant GNN (HyperSpec)
 #   "invariant_gnn"      — invariant SchNet-like GNN
 #   "monolithic_example" — minimal reference monolithic model
@@ -150,34 +155,17 @@ data:
 # ─────────────────────────────────────────────────────
 model:
   backbone:
-    name: kronos
+    name: monolithic_arace
 
-    # Pairwise-expert cutoff (Å). Linked to dressing cutoff by default.
-    # Override to decouple: model.backbone.cutoff=5.0
-    cutoff: ${model.backbone.dressing_kwargs.cutoff}
+    # Neighbour cutoff radius (Å) — must match data.cutoff.
+    cutoff: 8.0
 
     # ── Atomic-energy baseline ──────────────────────────────────────
-    # Subtracts per-element reference energies so the model learns
-    # residuals rather than absolute energies (O(thousand eV)).
-    # Dramatically improves training stability on multi-molecule datasets.
-    #
-    # Elements are discovered automatically from the training set.
-    # You never need to specify which elements are present.
-    #
-    # mode options:
+    # Same three modes as simurgh_gmd26.yaml:
     #   "learned"  — nn.Parameter, zero-init, jointly optimised.
-    #                Works without any prior knowledge.
-    #                Slowest to converge but always valid.
-    #   "dataset"  — least-squares regression on training set.
-    #                Recommended when isolated-atom DFT is unavailable.
-    #                Leave values: null; computed automatically.
-    #   "provided" — hand-set values from isolated-atom DFT.
-    #                Most accurate baseline.
-    #                REQUIRED: every element in the dataset must have a
-    #                value here or training will raise an error with
-    #                instructions on how to fix it.
-    #
-    # For "provided" mode, values in eV (PBE/def2-SVP example):
+    #   "dataset"  — least-squares regression on training set
+    #                (leave values: null; train.py injects them).
+    #   "provided" — hand-set isolated-atom DFT values (eV).
     atomic_energies:
       mode: provided
       values:
@@ -187,162 +175,55 @@ model:
         8: -2041.117735 # O
       compute_from_dataset: false # set true to force "dataset" mode
 
-    # Multiplicative scale on the MoE interaction energy.
+    # Multiplicative scale on the artisan interaction energy.
     # null = 1.0 for "learned" mode, auto-computed for "dataset"/"provided".
     scale: null
 
-    # elements: removed — automatically extracted from the training set
-    #           by train.py via compute_unique_elements(). K elements
-    #           → K*(K+1)/2 pair experts created automatically.
+    # elements: auto-extracted from the training set by train.py —
+    # never specify them here.
 
-    # ── Environment dressing (ACE-style message passing) ─────────────
-    # Produces per-atom equivariant features A_i before the pairwise MoE.
-    # Each interaction layer is a tensor-product message-passing round
-    # (MACE-style), optionally followed by an ACE body-order expansion.
-    dressing_kwargs:
-      # Atom-type embedding dimension (input to all dressing layers)
-      embedding_dim: 64
+    # ── ARACE stacking ──────────────────────────────────────
+    # Each round = one artisan layer (per-element-pair equivariant
+    # artisans on edges) + one ACE block (edge → node aggregation with
+    # equivariant linear + residual + RMS norm):
+    #   nodes → edges (artisan) → nodes (ACE) → edges (artisan) → ...
+    num_rounds: 2 # number of artisan + ACE rounds
 
-      # Equivariant hidden width per l-block.
-      # irreps_hidden = hidden_channels × (0e + 1o + 2e + ...)
-      hidden_channels: 32
+    # true  → one artisan bank shared by every round (fewer params)
+    # false → independent bank per round (default, more expressive)
+    share_artisan_weights: false
 
-      # Maximum spherical-harmonic order:
-      #   0 = scalars only (invariant, no equivariance)
-      #   1 = + vectors (captures bond directions)
-      #   2 = + rank-2 tensors / quadrupoles (captures angles) — default
-      #   3 = + rank-3 / octupoles (captures dihedrals, ~2× memory)
-      lmax: 2
+    # Initial node features: atomic-number embedding lookup projected
+    # into the artisans' equivariant space.  There is NO separate
+    # environment-dressing phase — the first artisan layer operates
+    # directly on these embeddings.
+    embedding_dim: 64
+    num_elements: 9 # embedding table size; must be > max(Z) in the data
 
-      # Bessel radial basis functions (standard: 8; more = finer radial detail)
-      num_radial_basis: 8
+    # Mean neighbours per atom for the ACE aggregation normalisation.
+    # null = no normalisation (this backbone has no dressing_kwargs, so
+    # train.py does not auto-inject it; set a value to enable).
+    avg_num_neighbors: null
 
-      # Radial MLP hidden width (maps RBF → TP weights)
-      radial_mlp_hidden: 32
-
-      # Neighbour cutoff radius (Å) — must match data.cutoff
-      cutoff: 8.0
-
-      # Number of ACE message-passing rounds (num_interactions = num_message_passing)
-      # More rounds → longer-range interactions but slower.
-      # 1–3 typical; 2 is the recommended default.
-      num_interactions: 2
-      num_message_passing: 2 # legacy alias, keep in sync with num_interactions
-
-      # ACE body-order expansion on the final layer output:
-      #   1 → A_i           (already 3-body via the MP tensor product)
-      #   2 → B² = A ⊗ A   (captures bond angles, 4-body)
-      #   3 → B³ = B² ⊗ A  (captures dihedrals, 5-body; expensive)
-      body_order: 1
-
-      # Element-conditioned tensor product weights.
-      # true  → TP weights multiplied by per-element scale per destination atom
-      #         (carbon and nitrogen in identical environments → different messages)
-      # false → element-agnostic (ablation)
-      element_conditioned: true
-
-      # Per-layer energy readout.
-      # true  → small MLP readout after each interaction layer contributes its
-      #         own per-node energy (MACE-style body-order decomposition)
-      # false → only the final layer is read out (original KRONOS behaviour)
-      per_layer_readout: true
-
-      # MACE-style SymmetricContraction for body_order >= 2.
-      # true  → per-element learnable CG weights (more expressive, recommended
-      #         for MLIP production runs with body_order=2)
-      # false → shared-weight CG path (fast, bitwise-reproducible)
-      symmetric_contraction: false
-
-      # Mean neighbours per atom in the training set.
-      # null = auto-computed by train.py via compute_avg_num_neighbors.
-      avg_num_neighbors: null
-
-      # Aggregation normalisation exponent:
-      #   1.0 → divide by N̄       (MACE-style, recommended)
-      #   0.5 → divide by sqrt(N̄) (original KRONOS behaviour)
-      agg_norm_exponent: 1.0
-
-      # Embedding table size — must be > max(Z) of any element in the dataset.
-      # 9 covers H–F (Z=1–9). Increase for heavier elements (e.g. 37 for up to Kr).
-      # Elements are discovered automatically; this only sizes the embedding table.
-      num_elements: 9
-
-    # ── Pairwise MoE experts ──────────────────────────────────────────
-    # One expert per element pair (e.g. H-H, H-C, H-O, C-C, C-O, O-O).
-    # Routed by edge type: each edge selects exactly one expert.
-    expert_config:
-      # Width of the invariant scalar projection of each atom's features
-      # fed to each expert (applied independently on each endpoint).
-      scalar_channels: 32
-
-      # Expert architecture: "linear" (MLP) or "transformer"
-      #
-      # "linear" (default): per-pair MLP reading
-      #   [scalars_A, scalars_B, pair_distance] → 1 scalar energy
-      #   hidden_dims specifies MLP hidden widths; final layer is always
-      #   Linear→1 (no activation). Fast, recommended.
-      #
-      # "transformer": E(3)-safe transformer on invariant scalars.
-      #   Treats [scalars_A, scalars_B, distance_embedding] as 3 tokens.
-      #   Slower but captures more complex many-body patterns within a pair.
-      expert_type: linear
-      hidden_dims: [128, 64] # MLP hidden widths for "linear" expert
-      dropout_rate: 0.1 # dropout between Linear layers; 0.0 = off
-
-      # Transformer-specific (only used when expert_type: "transformer")
-      # transformer_heads: 4
-      # transformer_layers: 2
-
-      # Data-driven routing for rare element pairs.
-      # Prevents overfit on rare pairs (e.g. S-I) with few training examples.
-      # Pairs below min_pair_frequency are routed to a shared RarePairExpert
-      # conditioned on a learned pair-type embedding rather than getting a
-      # dedicated expert with insufficient training data.
-      rare_pair_expert:
-        enabled: false # set true to activate
-        min_pair_frequency: 0.01 # pairs below 1% of edges → RarePairExpert
-        pair_embed_dim: 16 # embedding dim for rare pair type encoding
-
-      # pair_counts injected by train.py when rare_pair_expert.enabled=true
-      pair_counts: null
-
-    # Whether to compute per-pair forces via autograd through each expert.
-    # Required for head.mode="pairwise". Adds compute overhead.
-    compute_pairwise_forces: false
+    # ── Equivariant pair artisans (primary learning component) ──────
+    # One artisan per unordered element pair per layer (shared across
+    # layers when share_artisan_weights is true).  Architecture must be
+    # "equivariant" — the ARACE variant is equivariant
+    # throughout; invariants appear only in each layer's scalar readout.
+    artisan:
+      architecture: "equivariant"
+      hidden_irreps: "16x0e + 16x1o + 16x2e" # node/pair equivariant width
+      num_layers: 1 # 1 = TP only; >1 adds residual EquivLinear+Norm layers
+      num_rbf: 8 # Bessel radial basis functions
+      radial_hidden: 32 # radial MLP hidden width
+      n_scalar_out: 16 # invariant scalars before the energy MLP
+      final_hidden: 16 # energy MLP hidden width
+      element_conditioned: true # modulate TP weights by destination element
 
   # ── Task head ──────────────────────────────────────────────────────
-  # Consumes NodeFeatures from backbone and predicts energy + forces.
-  #
-  # Force-prediction modes (for "dual_forces" and "energy_forces"):
-  #   "autograd"  — F = -∂E/∂r, energy-conserving. Default.
-  #   "direct"    — equivariant 1x1o projection. Non-conservative, cheaper.
-  #   "hybrid"    — autograd + correction_weight * direct_forces.
-  #                 Keep correction_weight small (0.05) to stay near-conservative.
-  #   "pairwise"  — per-pair autograd with exact Newton's 3rd law.
-  #                 Requires backbone.compute_pairwise_forces=true.
-  #
-  # For "energy" head (no forces):
-  #   Remove irreps_in and hidden_dim; head needs no additional config.
-  #
-  # For "scalar" head:
-  #   property_name: "homo"
-  #   reduction: "mean"   # "mean" (intensive) or "sum" (extensive)
-  #
-  # For "multi" head:
-  #   heads:
-  #     - name: energy_forces
-  #     - name: scalar
-  #       property_name: homo
-  #
-  # irreps_in must match dressing_kwargs:
-  #   {hidden_channels}x0e + {hidden_channels}x1o + {hidden_channels}x2e
-  head:
-    name: energy_forces
-    irreps_in: "${model.backbone.dressing_kwargs.hidden_channels}x0e+${model.backbone.dressing_kwargs.hidden_channels}x1o+${model.backbone.dressing_kwargs.hidden_channels}x2e"
-    hidden_dim: 128
-    compute_stress: false # set true for periodic systems with stress labels
-    # mode / correction_weight / pairwise_correction_weight only apply to
-    # name: dual_forces — remove this comment block when switching heads.
+  # Monolithic backbone — returns the property dict (energy + autograd
+  # forces) directly; a task head is incompatible.
+  head: null
 
 # ─────────────────────────────────────────────────────
 # TRAINER
@@ -571,7 +452,7 @@ training:
   #   "forces"          — atomic forces MAE/MSE
   #   "stress"          — virial stress (periodic systems)
   #   "newton"          — Newton violation penalty (force conservation)
-  #   "gate_reg"        — L2 on MoE gate params (prevents expert collapse)
+  #   "gate_reg"        — L2 on artisan gate params (prevents expert collapse)
   #   "dipole"          — dipole moment
   #   "scalar_property" — generic scalar, set property_name
   losses:
@@ -645,11 +526,15 @@ checkpoint_manager:
     enabled: true
     filename: "last.ckpt"
 
+  # Self-contained .simurgh archives — see simurgh_gmd26.yaml for docs.
+  save_archive: true
+  archive_interval: false
+
 # ─────────────────────────────────────────────────────
 # CALLBACKS
 # ─────────────────────────────────────────────────────
 # Each callback is enabled/disabled inline here.
-# GOALCheckpointManager above is always active for KRONOS experiments.
+# GOALCheckpointManager above is always active for SIMURGH experiments.
 #
 # Available Lightning callbacks (enable by uncommenting):
 #
@@ -744,7 +629,7 @@ logger:
   # Weights & Biases (recommended for research tracking):
   wandb:
     _target_: lightning.pytorch.loggers.wandb.WandbLogger
-    name: ${run_name} # format: YYYY-MM-DD_HH-MM-SS_trajectory_kronos
+    name: ${run_name} # format: YYYY-MM-DD_HH-MM-SS_trajectory_simurgh
     project: "goal"
     entity: null # null = your default W&B entity
     save_dir: "${paths.output_dir}"
@@ -752,7 +637,7 @@ logger:
     id: null # set to resume a specific W&B run
     log_model: false # true = upload checkpoints to W&B
     group: ""
-    tags: ["kronos", "gmd"]
+    tags: ["simurgh", "arace", "gmd"]
 
   # TensorBoard:
   # tensorboard:
@@ -765,7 +650,7 @@ logger:
   # MLflow:
   # mlflow:
   #   _target_: lightning.pytorch.loggers.mlflow.MLFlowLogger
-  #   experiment_name: "kronos-gmd"
+  #   experiment_name: "simurgh-gmd"
   #   tracking_uri: "http://localhost:5000"
   #   tags: null
 
@@ -780,7 +665,7 @@ logger:
   # aim:
   #   _target_: aim.pytorch_lightning.AimLogger
   #   repo: ${paths.log_dir}/aim
-  #   experiment: "kronos-gmd26"
+  #   experiment: "simurgh-gmd26"
   #   system_tracking_interval: 10   # seconds; null = disable system metrics
   #   log_system_params: true
   #   capture_terminal_logs: false   # avoid console log loop
@@ -789,7 +674,7 @@ logger:
   # comet:
   #   _target_: lightning.pytorch.loggers.comet.CometLogger
   #   api_key: ${oc.env:COMET_API_TOKEN}
-  #   project_name: "goal-kronos"
+  #   project_name: "goal-simurgh"
   #   offline: false
 
 # ─────────────────────────────────────────────────────

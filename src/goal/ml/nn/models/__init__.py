@@ -13,10 +13,10 @@ The project ships four reference models:
                           e3nn primitives (educational baseline).
 * ``monolithic_example``— Minimal **monolithic** model returning the
                           property dict directly (educational baseline).
-* ``kronos`` / ``kronos_monolithic`` — The **native** KRONOS model
-                          (K-order Routed Orthogonal Network of Symmetry
-                          with Element-Pair Mixture-of-Experts).  See
-                          :mod:`goal.ml.nn.models.kronos`.
+* ``simurgh`` / ``simurgh_monolithic`` — The **native** SIMURGH model
+                          (equivariant force field with an element-pair
+                          bank of potential artisans).  See
+                          :mod:`goal.ml.nn.models.simurgh`.
 """
 
 from __future__ import annotations

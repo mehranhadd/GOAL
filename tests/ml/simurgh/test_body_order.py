@@ -1,4 +1,4 @@
-"""ACE body-order expansion tests for KRONOS.
+"""ACE body-order expansion tests for SIMURGH.
 
 Validates the two acceptance criteria from CHANGE 4:
 
@@ -22,7 +22,7 @@ from torch_geometric.data import Batch
 
 from goal.ml.data.graph import AtomicGraph
 from goal.ml.nn.blocks.env_dressing import EnvironmentDressing
-from tests.ml.kronos.conftest import random_so3
+from tests.ml.simurgh.conftest import random_so3
 
 
 def _make_dressing(body_order: int, seed: int = 0) -> EnvironmentDressing:

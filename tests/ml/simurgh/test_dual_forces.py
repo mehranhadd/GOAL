@@ -26,7 +26,7 @@ def _fake_features(num_atoms: int, irreps: str, dtype: torch.dtype) -> NodeFeatu
     irreps_obj = Irreps(irreps)
     feats = torch.randn(num_atoms, irreps_obj.dim, dtype=dtype, requires_grad=True)
     # Pre-populate node_energies that *do* depend on positions to make
-    # autograd well-defined.  The actual KRONOS backbone does this for us.
+    # autograd well-defined.  The actual SIMURGH backbone does this for us.
     return NodeFeatures(node_feats=feats, irreps=irreps)
 
 

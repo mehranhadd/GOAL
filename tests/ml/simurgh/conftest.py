@@ -1,4 +1,4 @@
-"""Shared fixtures for KRONOS tests.
+"""Shared fixtures for SIMURGH tests.
 
 Provides hand-crafted molecules (methane, water, methylamine) and optional
 real GMD trajectory data, all wrapped as ``AtomicGraph`` / PyG ``Batch``
@@ -31,7 +31,7 @@ from goal.ml.data.graph import AtomicGraph
 # ---------------------------------------------------------------------------
 
 _GMD_TRAJ: Path = (
-    Path(__file__).parents[3]  # …/tests/ml/kronos → project root
+    Path(__file__).parents[3]  # …/tests/ml/simurgh → project root
     / "data"
     / "GMD"
     / "FragmentDuplication"
@@ -146,7 +146,7 @@ def methylamine_batch() -> Batch:
 def carbon_dimer_batch() -> Batch:
     """PyG batch holding a single C-C dimer (only one pair type present).
 
-    Used by ``test_experts.py`` to verify that — with KRONOS configured
+    Used by ``test_experts.py`` to verify that — with SIMURGH configured
     for H/C/N/O — running on this batch contributes exactly ``0.0`` from
     the 9 non-CC experts, even though they all execute every step.
     """

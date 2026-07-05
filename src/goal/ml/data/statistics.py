@@ -231,12 +231,12 @@ def compute_pair_counts(
     For each graph, walks every directed edge ``(i, j)`` and increments the
     counter for the canonical pair ``(min(Z_i, Z_j), max(Z_i, Z_j))``.
     Bidirectional edges are counted twice (once as ``i→j`` and once as
-    ``j→i``) which matches the convention used in :class:`KronosMoE`
+    ``j→i``) which matches the convention used in :class:`SimurghArtisanBank`
     (each undirected pair contributes exactly two directed edges).
 
-    Used by :class:`KronosMoE` to decide whether a pair is common enough
-    to warrant a dedicated :class:`PairwiseExpert` or should be routed to
-    the shared :class:`RarePairExpert`.
+    Used by :class:`SimurghArtisanBank` to decide whether a pair is common enough
+    to warrant a dedicated :class:`PotentialArtisan` or should be routed to
+    the shared :class:`RarePotentialArtisan`.
 
     Parameters
     ----------

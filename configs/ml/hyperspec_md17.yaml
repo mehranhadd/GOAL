@@ -8,8 +8,8 @@
 # documented in comments showing what else is available.
 # No other file needs to be opened to understand what is possible.
 #
-# HyperSpec is a native equivariant GNN (not MoE).
-# Use this as a strong baseline against KRONOS, or for tasks where
+# HyperSpec is a native equivariant GNN (not an artisan bank).
+# Use this as a strong baseline against SIMURGH, or for tasks where
 # the mixture-of-experts structure is not needed (single-element
 # systems, small datasets, ablation studies).
 ########################################################
@@ -74,7 +74,7 @@ data:
   seed: 42
   dtype: float64
 
-  batch_size: 16 # HyperSpec handles larger batches than KRONOS MoE
+  batch_size: 16 # HyperSpec handles larger batches than SIMURGH artisan bank
   num_workers: 0
   pin_memory: false
   persistent_workers: false
@@ -89,8 +89,9 @@ data:
 # MODEL
 # ─────────────────────────────────────────────────────
 # backbone.name options:
-#   "kronos"             — E(3)-equivariant MoE force field
-#   "kronos_monolithic"  — KRONOS without backbone/head split
+#   "simurgh"             — E(3)-equivariant artisan-bank force field
+#   "simurgh_monolithic"  — SIMURGH without backbone/head split
+#   "monolithic_arace"   — SIMURGH ARACE: artisans + ACE alternating, monolithic
 #   "hyperspec"          — E(3)-equivariant GNN (this file)
 #   "invariant_gnn"      — invariant SchNet-like GNN
 #   "monolithic_example" — minimal reference monolithic model
@@ -142,10 +143,10 @@ model:
 
     # Note: HyperSpec does NOT have:
     #   - atomic_energies (no energy baseline subtraction)
-    #   - expert_config (no mixture of experts)
+    #   - artisan_config (no mixture of experts)
     #   - dressing_kwargs (uses flat hyperparams above)
     #   - elements list (uses num_elements embedding table)
-    # For energy baseline subtraction, use KRONOS or add a
+    # For energy baseline subtraction, use SIMURGH or add a
     # ScaleShiftBlock wrapper around HyperSpec.
 
   # ── Task head ──────────────────────────────────────────────────────
@@ -157,7 +158,7 @@ model:
   #   "autograd" — F = -∂E/∂r (conservative, energy-conserving)
   #   "direct"   — equivariant 1x1o projection (non-conservative, cheaper)
   #   "hybrid"   — autograd + correction_weight * direct
-  #   "pairwise" — not applicable to HyperSpec (KRONOS-only)
+  #   "pairwise" — not applicable to HyperSpec (SIMURGH-only)
   head:
     name: energy_forces
     irreps_in: "128x0e+128x1o+128x2e" # must match hidden_channels × lmax irreps
@@ -244,10 +245,10 @@ training:
     decay: 0.99
 
   # No position noise by default for HyperSpec baseline
-  # (add 0.005 to match KRONOS training conditions for fair comparison)
+  # (add 0.005 to match SIMURGH training conditions for fair comparison)
   position_noise_std: 0.0
 
-  # HyperSpec: no stage curriculum needed (no MoE gate collapse risk)
+  # HyperSpec: no stage curriculum needed (no artisan gate collapse risk)
   # Simple single-stage training from epoch 0.
   # Uncomment stages block to enable curriculum:
   # stages:
@@ -267,7 +268,7 @@ training:
   # fn options: "mse", "mae", "rmse", "huber", "smooth_l1"
   # normalize_by_n_atoms: false for MD17 (single fixed-size molecule)
   #
-  # HyperSpec has no gate_reg loss (no MoE gates to regularise).
+  # HyperSpec has no gate_reg loss (no artisan gates to regularise).
   # Available losses:
   #   "energy"          — per-atom energy MAE/MSE
   #   "forces"          — atomic forces MAE/MSE
@@ -292,7 +293,7 @@ training:
 # CHECKPOINTING
 # ─────────────────────────────────────────────────────
 # Three independent pools: top_k, interval, last.
-# See kronos_gmd26.yaml for full documentation of all options.
+# See simurgh_gmd26.yaml for full documentation of all options.
 #
 # metric options (any val/ metric logged during training):
 #   "val/forces_mae"               — force MAE (min)
@@ -319,10 +320,14 @@ checkpoint_manager:
     enabled: true
     filename: "last.ckpt"
 
+  # Self-contained .simurgh archives — see simurgh_gmd26.yaml for docs.
+  save_archive: true
+  archive_interval: false
+
 # ─────────────────────────────────────────────────────
 # CALLBACKS
 # ─────────────────────────────────────────────────────
-# See kronos_gmd26.yaml for full documentation of all available callbacks.
+# See simurgh_gmd26.yaml for full documentation of all available callbacks.
 # ─────────────────────────────────────────────────────
 callbacks:
   rich_progress_bar:
@@ -370,7 +375,7 @@ callbacks:
 # ─────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────
-# See kronos_gmd26.yaml for full documentation of all available loggers.
+# See simurgh_gmd26.yaml for full documentation of all available loggers.
 # ─────────────────────────────────────────────────────
 logger:
   csv:
@@ -397,7 +402,7 @@ logger:
 # ─────────────────────────────────────────────────────
 # DISTRIBUTED TRAINING
 # ─────────────────────────────────────────────────────
-# See kronos_gmd26.yaml for full documentation of all strategy options.
+# See simurgh_gmd26.yaml for full documentation of all strategy options.
 # ─────────────────────────────────────────────────────
 strategy:
   name: auto
@@ -430,5 +435,5 @@ ckpt_path: null
 # ─────────────────────────────────────────────────────
 # HYPERPARAMETER SEARCH
 # ─────────────────────────────────────────────────────
-# See kronos_gmd26.yaml for full search configuration options.
+# See simurgh_gmd26.yaml for full search configuration options.
 hparams_search: null

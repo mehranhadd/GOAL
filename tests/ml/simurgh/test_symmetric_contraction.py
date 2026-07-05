@@ -27,7 +27,7 @@ from goal.ml.nn.blocks.symmetric_contraction import (
     PerElementWeightedTensorProduct,
     SymmetricContraction,
 )
-from tests.ml.kronos.conftest import random_so3
+from tests.ml.simurgh.conftest import random_so3
 
 # ---------------------------------------------------------------------------
 # Unit tests for the per-element primitives

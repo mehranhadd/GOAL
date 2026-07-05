@@ -2,12 +2,12 @@
 
 Guards two specific failure modes:
 
-1. **Always-zero from broken autograd path.**  When the KRONOS
+1. **Always-zero from broken autograd path.**  When the SIMURGH
    backbone forgot to enable ``requires_grad`` on ``graph.pos``,
    :class:`DualForcesHead` fell back to all-zero forces, and the
    cosine metric collapsed to exactly ``0.0`` regardless of the
    target.  The autograd fix lives in
-   ``goal.ml.nn.models.kronos.backbone.KronosBackbone.forward`` —
+   ``goal.ml.nn.models.simurgh.backbone.SimurghBackbone.forward`` —
    this test enforces that forces survive a backbone+head forward
    with cold positions.
 
@@ -25,7 +25,7 @@ import torch
 from torch_geometric.data import Batch
 
 from goal.ml.nn.heads.dual_forces import DualForcesHead
-from goal.ml.nn.models.kronos.backbone import KronosBackbone
+from goal.ml.nn.models.simurgh.backbone import SimurghBackbone
 from goal.ml.training.metrics import mlip_metrics
 
 
@@ -115,12 +115,12 @@ class TestCosineZeroTargetHandling:
 
 
 class TestBackboneEnablesGradOnPositions:
-    """The KRONOS backbone must enable ``requires_grad`` on positions
+    """The SIMURGH backbone must enable ``requires_grad`` on positions
     so :class:`DualForcesHead` doesn't fall into its zero-force branch."""
 
     def test_pos_grad_enabled_after_forward(self, methane_batch: Batch) -> None:
         torch.manual_seed(0)
-        backbone: KronosBackbone = KronosBackbone(
+        backbone: SimurghBackbone = SimurghBackbone(
             elements=(1, 6),
             dressing_kwargs=dict(
                 num_elements=9,
@@ -132,7 +132,7 @@ class TestBackboneEnablesGradOnPositions:
                 radial_mlp_hidden=8,
                 num_message_passing=1,
             ),
-            expert_config=dict(hidden_dims=(8, 8)),
+            artisan_config=dict(hidden_dims=(8, 8)),
         ).double()
         # The batch's positions arrive cold (no autograd).
         assert methane_batch.pos.requires_grad is False
@@ -144,7 +144,7 @@ class TestBackboneEnablesGradOnPositions:
     def test_dual_forces_head_produces_nonzero_forces(self, methane_batch: Batch) -> None:
         """End-to-end: cold batch → backbone+head → forces ≠ 0."""
         torch.manual_seed(0)
-        backbone: KronosBackbone = KronosBackbone(
+        backbone: SimurghBackbone = SimurghBackbone(
             elements=(1, 6),
             dressing_kwargs=dict(
                 num_elements=9,
@@ -156,7 +156,7 @@ class TestBackboneEnablesGradOnPositions:
                 radial_mlp_hidden=8,
                 num_message_passing=1,
             ),
-            expert_config=dict(hidden_dims=(8, 8)),
+            artisan_config=dict(hidden_dims=(8, 8)),
         ).double()
         head: DualForcesHead = DualForcesHead(
             irreps_in=str(backbone.irreps_out),

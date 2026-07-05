@@ -28,7 +28,7 @@ dependencies = [
   "rich>=13",
   "rootutils",
   "hydra-colorlog",
-  "lmdb", "pytest>=9.0.3,<10", "ipython>=9.13.0,<10", "xonsh>=0.23.7,<0.24", "jupyter>=1.1.1,<2", "ipykernel>=7.2.0,<8",
+  "lmdb", "pytest>=9.0.3,<10", "ipython>=9.13.0,<10", "xonsh>=0.23.7,<0.24", "jupyter>=1.1.1,<2", "ipykernel>=7.2.0,<8", "rdkit>=2026.3.3,<2027",
 ]
 
 [project.optional-dependencies]
@@ -63,6 +63,8 @@ goal-finetune = "goal.ml.cli.finetune:finetune"
 goal-tune = "goal.ml.cli.tune:tune"
 goal-simulate = "goal.md.cli.simulate:simulate"
 goal-simulate-mts = "goal.md.cli.simulate:simulate_mts"
+goal-inspect = "goal.ml.cli.inspect_ckpt:main"
+goal-pack-archive = "goal.ml.cli.pack:main"
 
 # src/ is the source root: packages under src/ are importable directly
 # e.g. src/goal/ → import goal; src/goal/ml/ → from goal.ml import ...

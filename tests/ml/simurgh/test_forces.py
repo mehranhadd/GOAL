@@ -2,7 +2,7 @@
 
 Two properties under test:
 
-* **Newton's third law is exact** — when the MoE computes per-pair
+* **Newton's third law is exact** — when the artisan bank computes per-pair
   forces via ``-∂E_ij/∂r_ij`` and scatters with the
   ``+0.5 F`` / ``-0.5 F`` Newton-symmetric pattern, the net force per
   molecule must be zero to machine precision (``< 1e-10`` is the
@@ -24,15 +24,15 @@ import torch
 from torch_geometric.data import Batch
 
 from goal.ml.nn.heads.dual_forces import DualForcesHead
-from goal.ml.nn.models.kronos.backbone import KronosBackbone
+from goal.ml.nn.models.simurgh.backbone import SimurghBackbone
 
 
-def _small_kronos(
+def _small_simurgh(
     compute_pairwise_forces: bool,
     elements: typing.Sequence[int] = (1, 6, 7, 8),
-) -> KronosBackbone:
-    """Tiny KRONOS configuration suitable for fast unit tests."""
-    return KronosBackbone(
+) -> SimurghBackbone:
+    """Tiny SIMURGH configuration suitable for fast unit tests."""
+    return SimurghBackbone(
         elements=elements,
         dressing_kwargs={
             "num_elements": 120,
@@ -45,7 +45,7 @@ def _small_kronos(
             "num_message_passing": 1,
             "body_order": 1,
         },
-        expert_config={
+        artisan_config={
             "scalar_channels": 4,
             "hidden_dims": (8,),
             "expert_type": "linear",
@@ -69,7 +69,7 @@ class TestPairwiseNewton:
         methane_batch,  # noqa: ANN001 (pytest fixture)
     ) -> None:
         torch.manual_seed(0)
-        backbone = _small_kronos(compute_pairwise_forces=True)
+        backbone = _small_simurgh(compute_pairwise_forces=True)
         head = DualForcesHead(
             irreps_in="8x0e+8x1o",
             hidden_dim=16,
@@ -96,8 +96,8 @@ class TestPairwiseNewton:
         populate ``NodeFeatures.node_forces``; the energy-only build
         must leave it ``None``."""
         torch.manual_seed(0)
-        bb_pairwise = _small_kronos(compute_pairwise_forces=True)
-        bb_energy = _small_kronos(compute_pairwise_forces=False)
+        bb_pairwise = _small_simurgh(compute_pairwise_forces=True)
+        bb_energy = _small_simurgh(compute_pairwise_forces=False)
         feats_p = bb_pairwise(methane_batch)
         feats_e = bb_energy(methane_batch)
         assert feats_p.node_forces is not None
@@ -113,7 +113,7 @@ class TestPairwiseNewton:
 class TestPairwiseVsAutograd:
     """Pairwise and autograd forces must agree on direction *broadly*.
 
-    The two paths are not mathematically identical for KRONOS: the
+    The two paths are not mathematically identical for SIMURGH: the
     pairwise path only differentiates through ``r_ij`` inside the
     expert (capturing the direct-distance contribution), while the
     autograd path also picks up the environmental dependence through
@@ -129,9 +129,9 @@ class TestPairwiseVsAutograd:
         methane_batch,  # noqa: ANN001
     ) -> None:
         torch.manual_seed(0)
-        bb_pair = _small_kronos(compute_pairwise_forces=True)
+        bb_pair = _small_simurgh(compute_pairwise_forces=True)
         torch.manual_seed(0)
-        bb_auto = _small_kronos(compute_pairwise_forces=False)
+        bb_auto = _small_simurgh(compute_pairwise_forces=False)
 
         head_pair = DualForcesHead(irreps_in="8x0e+8x1o", hidden_dim=16, mode="pairwise").to(
             torch.float64
@@ -184,7 +184,7 @@ class TestPairwiseModeValidation:
         ``compute_pairwise_forces=False`` is a config mistake — the
         head receives ``node_forces=None`` and must complain loudly."""
         torch.manual_seed(0)
-        bb = _small_kronos(compute_pairwise_forces=False)
+        bb = _small_simurgh(compute_pairwise_forces=False)
         head = DualForcesHead(irreps_in="8x0e+8x1o", hidden_dim=16, mode="pairwise").to(
             torch.float64
         )

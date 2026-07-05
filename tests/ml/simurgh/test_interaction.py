@@ -23,7 +23,7 @@ import torch
 from e3nn.o3 import Irreps, spherical_harmonics
 
 from goal.ml.nn.blocks.interaction import EquivariantInteractionBlock
-from tests.ml.kronos.conftest import requires_gmd
+from tests.ml.simurgh.conftest import requires_gmd
 
 # ---------------------------------------------------------------------------
 # Helpers

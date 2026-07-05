@@ -166,12 +166,12 @@ class GOALModule(L.LightningModule):
         features: typing.Any = self.backbone(graph)
         predictions: dict[str, torch.Tensor] = self.head(features, graph)
         # Inject gate values (live, grad-enabled) for GateRegLoss.
-        # Duck-typed so non-KRONOS backbones are silently skipped.
+        # Duck-typed so non-SIMURGH backbones are silently skipped.
         # We read the raw Parameter rather than .gates() (which detaches).
-        if hasattr(self.backbone, "moe") and hasattr(self.backbone.moe, "experts"):
+        if hasattr(self.backbone, "artisan_bank") and hasattr(self.backbone.artisan_bank, "experts"):
             gate_list: list[torch.Tensor] = [
                 expert.gate  # type: ignore[union-attr]
-                for expert in self.backbone.moe.experts.values()
+                for expert in self.backbone.artisan_bank.artisans.values()
             ]
             if gate_list:
                 predictions["gate_values"] = torch.stack(gate_list)
@@ -390,13 +390,13 @@ class GOALModule(L.LightningModule):
         )
         self._log_step_metrics(predictions, batch, prefix="val/")
 
-        # Expert load-balance diagnostic (KRONOS only, validation only).
-        # Duck-typed — silently skipped for non-KRONOS backbones.
-        if hasattr(self.backbone, "compute_expert_loads"):
-            loads: dict[str, torch.Tensor] = self.backbone.compute_expert_loads(batch)
+        # Expert load-balance diagnostic (SIMURGH only, validation only).
+        # Duck-typed — silently skipped for non-SIMURGH backbones.
+        if hasattr(self.backbone, "compute_artisan_loads"):
+            loads: dict[str, torch.Tensor] = self.backbone.compute_artisan_loads(batch)
             load_var: torch.Tensor | None = loads.pop("load_variance", None)
             self.log_dict(
-                {f"val/expert_load/{k}": v for k, v in loads.items()},
+                {f"val/artisan_load/{k}": v for k, v in loads.items()},
                 batch_size=batch.num_graphs,
                 sync_dist=True,
                 on_step=False,
@@ -404,7 +404,7 @@ class GOALModule(L.LightningModule):
             )
             if load_var is not None:
                 self.log(
-                    "val/expert_load_variance",
+                    "val/artisan_load_variance",
                     load_var,
                     batch_size=batch.num_graphs,
                     sync_dist=True,

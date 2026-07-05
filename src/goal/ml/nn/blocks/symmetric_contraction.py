@@ -26,7 +26,7 @@ implementation uses :class:`e3nn.o3.FullyConnectedTensorProduct`
 iteratively, which is *not* the maximally symmetric construction but
 **is** equivariance-correct and captures the same expressivity for a
 modest weight-count overhead.  The equivariance tests in
-``tests/ml/kronos/test_symmetric_contraction.py`` enforce SO(3)
+``tests/ml/simurgh/test_symmetric_contraction.py`` enforce SO(3)
 covariance over the dressing block's full output irreps.
 """
 

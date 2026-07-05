@@ -1,5 +1,5 @@
 """Tests for the three atomic-energy modes (learned / dataset / provided)
-and the ScaleShift gain on KRONOS.
+and the ScaleShift gain on SIMURGH.
 
 Mirrors what MACE does with :class:`AtomicEnergiesBlock` and
 :class:`ScaleShiftBlock` — the model carries a per-element baseline
@@ -20,7 +20,7 @@ Covers:
   the expected baseline contribution.
 * ``mode="provided"`` — verify the values are registered as buffers
   (not parameters) and stay constant under an optimiser step.
-* Training-loop sanity — verify a KRONOS run on the synthetic
+* Training-loop sanity — verify a SIMURGH run on the synthetic
   dataset drives the training loss strictly down for at least 20
   optimiser steps in each mode.
 """
@@ -35,7 +35,7 @@ from torch_geometric.data import Batch
 
 from goal.ml.data.graph import AtomicGraph
 from goal.ml.data.statistics import compute_atomic_references, compute_energy_scale
-from goal.ml.nn.models.kronos.backbone import KronosBackbone
+from goal.ml.nn.models.simurgh.backbone import SimurghBackbone
 
 # ---------------------------------------------------------------------------
 # Synthetic multi-molecule dataset
@@ -172,7 +172,7 @@ def synthetic_dataset_noisy() -> list[AtomicGraph]:
 
     With 3 unique formulae and 3 unknowns the LSQ system is exactly
     determined and recovers any noisy labels *exactly* — leaving the
-    MoE no residual to fit.  Stacking 4 noisy copies per formula gives
+    artisan bank no residual to fit.  Stacking 4 noisy copies per formula gives
     an over-determined system so a real ``O(eV)`` residual survives
     for the training-loop tests to consume.
     """
@@ -236,16 +236,16 @@ class TestComputeEnergyScale:
 
 
 # ---------------------------------------------------------------------------
-# KronosBackbone modes
+# SimurghBackbone modes
 # ---------------------------------------------------------------------------
 
 
 def _small_backbone(
     atomic_energies: dict[str, typing.Any] | None,
     scale: float | None = None,
-) -> KronosBackbone:
-    """Tiny KronosBackbone configuration suitable for fast unit tests."""
-    return KronosBackbone(
+) -> SimurghBackbone:
+    """Tiny SimurghBackbone configuration suitable for fast unit tests."""
+    return SimurghBackbone(
         elements=(1, 6, 8),
         dressing_kwargs={
             "num_elements": 120,
@@ -258,7 +258,7 @@ def _small_backbone(
             "num_message_passing": 1,
             "body_order": 1,
         },
-        expert_config={
+        artisan_config={
             "scalar_channels": 4,
             "hidden_dims": (8,),
             "expert_type": "linear",
@@ -421,7 +421,7 @@ class TestScale:
 
 
 def _train_steps(
-    model: KronosBackbone,
+    model: SimurghBackbone,
     batch: Batch,
     targets: torch.Tensor,
     n_steps: int = 20,
@@ -481,7 +481,7 @@ def test_training_loss_monotone_dataset(synthetic_dataset_noisy) -> None:
     """``dataset`` mode: baseline carries the constant, residual fits fast.
 
     Uses the noisy dataset so a non-degenerate residual remains for the
-    MoE to fit — with the low-noise fixture the LSQ recovery would
+    artisan bank to fit — with the low-noise fixture the LSQ recovery would
     drive the initial loss to machine epsilon and there'd be nothing
     to optimise.
     """

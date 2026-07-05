@@ -25,7 +25,7 @@ Four force-prediction modes are supported, all selectable from config:
     construction.  When ``pairwise_correction_weight > 0`` the
     output is combined: ``F = F_autograd + w * F_pairwise``;
     otherwise it's pure pairwise.  Requires a backbone with
-    ``compute_pairwise_forces=True`` (KRONOS).
+    ``compute_pairwise_forces=True`` (SIMURGH).
 
 Set ``mode`` in the Hydra config — defaults to ``"autograd"`` so the
 behaviour matches ``EnergyForcesHead`` out of the box.
@@ -116,7 +116,7 @@ class DualForcesHead(nn.Module):
         graph: AtomicGraph,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Energy + helper tensors (batch index, num_atoms per graph)."""
-        # Backbones that already produce per-atom energies (e.g. KRONOS)
+        # Backbones that already produce per-atom energies (e.g. SIMURGH)
         # populate ``features.node_energies``; honour it when present.
         if features.node_energies is not None:
             node_energies: torch.Tensor = features.node_energies  # (N,)
@@ -160,7 +160,7 @@ class DualForcesHead(nn.Module):
             if features.node_forces is None:
                 raise ValueError(
                     "DualForcesHead.mode='pairwise' requires the backbone to "
-                    "populate features.node_forces (e.g. KRONOS with "
+                    "populate features.node_forces (e.g. SIMURGH with "
                     "compute_pairwise_forces=True)."
                 )
             forces_pairwise: torch.Tensor = features.node_forces  # (N, 3)

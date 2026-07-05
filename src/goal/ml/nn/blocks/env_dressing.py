@@ -1,8 +1,8 @@
-"""Environment dressing block for the KRONOS native model.
+"""Environment dressing block for the SIMURGH native model.
 
 Produces "dressed" per-atom features that already carry information from
 each atom's local neighbourhood, before they are fed into downstream
-blocks (the KRONOS pairwise experts, scalar readouts, etc.).
+blocks (the SIMURGH pairwise experts, scalar readouts, etc.).
 
 Pipeline
 --------
@@ -50,7 +50,7 @@ from goal.ml.nn.primitives.linear import EquivariantLinear
 
 
 def build_hidden_irreps(hidden_channels: int, lmax: int) -> Irreps:
-    """Build the standard KRONOS hidden irreps specification.
+    """Build the standard SIMURGH hidden irreps specification.
 
     Convention: even ``l`` → parity ``e``; odd ``l`` → parity ``o``.
 
@@ -168,14 +168,14 @@ class EnvironmentDressing(nn.Module):
         When ``True``, each interaction layer conditions its TP weights on
         the destination atom's element type via a
         ``Linear(n_elements, weight_numel, bias=False)`` map.  This is the
-        CHANGE-1 element-conditioning described in the KRONOS design doc.
+        CHANGE-1 element-conditioning described in the SIMURGH design doc.
         Backward-compatible default is ``False``.
     per_layer_readout : bool, optional
         When ``True``, attach a :class:`_LayerReadout` after each
         interaction layer and accumulate per-node energy contributions.
         The accumulated sum is returned alongside the final equivariant
         features; it is then added to the backbone's total energy on top
-        of the MoE contribution.  Default ``False`` (original behaviour).
+        of the artisan bank contribution.  Default ``False`` (original behaviour).
     symmetric_contraction : bool, optional
         When ``True`` and ``body_order >= 2``, use MACE-style
         :class:`SymmetricContraction` for the body-order expansion.

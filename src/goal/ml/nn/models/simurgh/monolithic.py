@@ -1,8 +1,8 @@
-"""Self-contained KRONOS model.
+"""Self-contained SIMURGH model.
 
 Satisfies the ``MonolithicModel`` protocol — takes an ``AtomicGraph``
 and returns a dictionary of predicted properties directly.  Uses the
-same :class:`EnvironmentDressing` and :class:`KronosMoE` building
+same :class:`EnvironmentDressing` and :class:`SimurghArtisanBank` building
 blocks as the modular backbone, plus a self-contained force pathway
 with the same three modes as :class:`DualForcesHead`
 (``autograd`` / ``direct`` / ``hybrid``).
@@ -22,16 +22,16 @@ from torch_geometric.utils import scatter
 
 from goal.ml.data.graph import AtomicGraph
 from goal.ml.nn.blocks.env_dressing import EnvironmentDressing
-from goal.ml.nn.blocks.experts import ExpertConfig, KronosMoE
-from goal.ml.nn.models.kronos.geometry import differentiable_edges
+from goal.ml.nn.blocks.artisans import ArtisanConfig, SimurghArtisanBank
+from goal.ml.nn.models.simurgh.geometry import differentiable_edges
 from goal.ml.nn.primitives.linear import EquivariantLinear
 from goal.ml.registry import BACKBONE_REGISTRY, MODEL_REGISTRY
 
 
-@MODEL_REGISTRY.register("kronos_monolithic")
-@BACKBONE_REGISTRY.register("kronos_monolithic")
-class KronosMonolithic(nn.Module):
-    """Self-contained KRONOS model.
+@MODEL_REGISTRY.register("simurgh_monolithic")
+@BACKBONE_REGISTRY.register("simurgh_monolithic")
+class SimurghMonolithic(nn.Module):
+    """Self-contained SIMURGH model.
 
     Returns a property dictionary with ``"energy"``, ``"forces"`` (and
     ``"num_atoms"``) directly.
@@ -43,8 +43,8 @@ class KronosMonolithic(nn.Module):
     dressing_kwargs : dict
         Forwarded to :class:`EnvironmentDressing`.  Includes
         ``body_order`` for the ACE body-order expansion.
-    expert_config : dict
-        Forwarded to :class:`ExpertConfig`.
+    artisan_config : dict
+        Forwarded to :class:`ArtisanConfig`.
     cutoff : float, optional
         Cosine-cutoff radius for the experts.  Defaults to the dressing
         cutoff if unset.
@@ -59,7 +59,7 @@ class KronosMonolithic(nn.Module):
         self,
         elements: typing.Sequence[int] = (1, 6, 7, 8),
         dressing_kwargs: dict[str, typing.Any] | None = None,
-        expert_config: dict[str, typing.Any] | None = None,
+        artisan_config: dict[str, typing.Any] | None = None,
         cutoff: float | None = None,
         forces_mode: str = "autograd",
         correction_weight: float = 0.1,
@@ -71,17 +71,24 @@ class KronosMonolithic(nn.Module):
             )
 
         dressing_cfg: dict[str, typing.Any] = dict(dressing_kwargs or {})
-        expert_cfg: dict[str, typing.Any] = dict(expert_config or {})
-        if "hidden_dims" in expert_cfg:
-            expert_cfg["hidden_dims"] = tuple(int(x) for x in expert_cfg["hidden_dims"])
+        artisan_cfg: dict[str, typing.Any] = dict(artisan_config or {})
+        if "hidden_dims" in artisan_cfg:
+            artisan_cfg["hidden_dims"] = tuple(int(x) for x in artisan_cfg["hidden_dims"])
+
+        # Normalise the nested equivariant sub-config (may arrive as an
+        # OmegaConf DictConfig) to a plain dict for ArtisanConfig.
+        if artisan_cfg.get("equivariant") is not None:
+            artisan_cfg["equivariant"] = {
+                str(k): v for k, v in dict(artisan_cfg["equivariant"]).items()
+            }
 
         self.dressing: EnvironmentDressing = EnvironmentDressing(**dressing_cfg)
-        moe_cutoff: float = cutoff if cutoff is not None else self.dressing.cutoff
-        self.moe: KronosMoE = KronosMoE(
+        bank_cutoff: float = cutoff if cutoff is not None else self.dressing.cutoff
+        self.artisan_bank: SimurghArtisanBank = SimurghArtisanBank(
             elements=elements,
             irreps_in=self.dressing.irreps_out,
-            expert_config=ExpertConfig(**expert_cfg),
-            cutoff=moe_cutoff,
+            artisan_config=ArtisanConfig(**artisan_cfg),
+            cutoff=bank_cutoff,
         )
 
         self.forces_mode: str = forces_mode
@@ -107,12 +114,12 @@ class KronosMonolithic(nn.Module):
     @property
     def elements(self) -> tuple[int, ...]:
         """Return the atomic numbers covered by this model."""
-        return self.moe.elements
+        return self.artisan_bank.elements
 
     @property
-    def num_experts(self) -> int:
+    def num_artisans(self) -> int:
         """Return the total number of pair-based experts."""
-        return self.moe.num_experts
+        return self.artisan_bank.num_artisans
 
     @property
     def irreps_out(self) -> Irreps:
@@ -126,7 +133,7 @@ class KronosMonolithic(nn.Module):
 
     def gates(self) -> dict[str, torch.Tensor]:
         """Return expert gating weights indexed by atomic pair type."""
-        return self.moe.gates()
+        return self.artisan_bank.gates()
 
     # ------------------------------------------------------------------
     # Forward
@@ -161,11 +168,12 @@ class KronosMonolithic(nn.Module):
             edge_lengths=edge_lengths,
         )  # (N, irreps_out.dim), layer_energies ignored in monolithic path
 
-        node_energies: torch.Tensor = self.moe(
+        node_energies: torch.Tensor = self.artisan_bank(
             atom_features=dressed,
             atomic_numbers=graph.atomic_numbers,
             edge_index=graph.edge_index,
             edge_lengths=edge_lengths,
+            edge_vectors=edge_vectors,
         )  # (N,)
 
         batch: torch.Tensor = (

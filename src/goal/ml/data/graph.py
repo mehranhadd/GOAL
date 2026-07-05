@@ -38,9 +38,9 @@ class AtomicGraph(Data):
         # Graph topology — only the index pairs are mandatory.
         edge_index: torch.Tensor,  # (2, E) int64
         # ``edge_vectors`` and ``edge_lengths`` are kept *optional* because
-        # the production force-prediction path (``KronosBackbone`` +
+        # the production force-prediction path (``SimurghBackbone`` +
         # ``DualForcesHead``) recomputes both from ``positions`` inside
-        # ``goal.ml.nn.models.kronos.geometry.differentiable_edges`` so the
+        # ``goal.ml.nn.models.simurgh.geometry.differentiable_edges`` so the
         # autograd chain links forces back to ``graph.pos``.  Storing them
         # on the graph just adds ~30% per-batch VRAM with no consumer in
         # that pipeline.  Callers that *do* need them at rest (e.g. the
@@ -265,7 +265,7 @@ class NodeFeatures:
     node_forces: torch.Tensor | None = None
     """(N, 3) per-atom forces produced by a pairwise-force backbone.
 
-    When populated (e.g. by ``KronosBackbone`` with
+    When populated (e.g. by ``SimurghBackbone`` with
     ``compute_pairwise_forces=True``), force-aware heads can consume
     these directly instead of taking an additional
     ``autograd.grad(energy, positions)`` pass.  Newton's third law is

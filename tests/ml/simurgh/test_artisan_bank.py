@@ -1,22 +1,22 @@
-"""Per-block tests for KRONOS experts.
+"""Per-block tests for SIMURGH potential artisans.
 
 Validates:
 
 * ``enumerate_element_pairs`` enumerates unordered pairs in a
   deterministic, sorted order.
 * ``cosine_cutoff`` is exactly zero at and beyond the cutoff.
-* ``PairwiseExpert`` produces a single scalar per pair for both the
+* ``PotentialArtisan`` produces a single scalar per pair for both the
   Linear and Transformer backbones.
-* ``KronosMoE`` runs every expert exactly once per forward pass, even
+* ``SimurghArtisanBank`` runs every expert exactly once per forward pass, even
   when some pair types are absent (zero-mask rule).
 * Per-pair gates are registered learnable parameters named
-  ``experts.z{a}_z{b}.gate``.
+  ``artisans.z{a}_z{b}.gate``.
 * **Static zero-masking schedule**: on a batch that only contains one
   pair type (C-C), every one of the nine absent experts still executes
   and contributes exactly ``0.0`` to the total energy.
 * **Data-driven routing (CHANGE 4)**: pairs below ``min_pair_frequency``
-  are routed to the shared ``RarePairExpert``; common pairs keep their
-  dedicated ``PairwiseExpert``.
+  are routed to the shared ``RarePotentialArtisan``; common pairs keep their
+  dedicated ``PotentialArtisan``.
 """
 
 from __future__ import annotations
@@ -27,16 +27,16 @@ import pytest
 import torch
 from e3nn.o3 import Irreps
 
-from goal.ml.nn.blocks.experts import (
-    ExpertConfig,
-    KronosMoE,
-    PairwiseExpert,
-    RarePairExpert,
+from goal.ml.nn.blocks.artisans import (
+    ArtisanConfig,
+    SimurghArtisanBank,
+    PotentialArtisan,
+    RarePotentialArtisan,
     cosine_cutoff,
     enumerate_element_pairs,
     pair_label,
 )
-from tests.ml.kronos.conftest import requires_gmd
+from tests.ml.simurgh.conftest import requires_gmd
 
 
 class TestEnumerateElementPairs:
@@ -61,7 +61,7 @@ class TestEnumerateElementPairs:
         assert pairs == enumerate_element_pairs([1, 6, 7, 8])
 
     def test_duplicates_collapsed(self) -> None:
-        # KronosMoE collapses duplicates; helper itself does not, but check
+        # SimurghArtisanBank collapses duplicates; helper itself does not, but check
         # K * (K + 1) / 2 formula
         pairs = enumerate_element_pairs([1, 6])
         assert len(pairs) == 3
@@ -93,18 +93,18 @@ class TestCosineCutoff:
         assert (diffs <= 1e-12).all()
 
 
-class TestPairwiseExpert:
+class TestPotentialArtisan:
     @pytest.mark.parametrize("expert_type", ["linear", "transformer"])
     def test_outputs_scalar_per_pair(self, expert_type: str) -> None:
         irreps_in = Irreps("8x0e+8x1o+8x2e")
-        cfg = ExpertConfig(
+        cfg = ArtisanConfig(
             scalar_channels=8,
             hidden_dims=(32, 16),
             expert_type=expert_type,
             transformer_heads=2,
             transformer_layers=1,
         )
-        expert = PairwiseExpert(irreps_in, cfg).double()
+        expert = PotentialArtisan(irreps_in, cfg).double()
         # Random scalars for 5 pairs
         scalars_a = torch.randn(5, 8, dtype=torch.float64)
         scalars_b = torch.randn(5, 8, dtype=torch.float64)
@@ -114,55 +114,55 @@ class TestPairwiseExpert:
 
     def test_gate_is_a_parameter(self) -> None:
         irreps_in = Irreps("4x0e")
-        cfg = ExpertConfig(scalar_channels=4, hidden_dims=(8,), expert_type="linear")
-        expert = PairwiseExpert(irreps_in, cfg)
+        cfg = ArtisanConfig(scalar_channels=4, hidden_dims=(8,), expert_type="linear")
+        expert = PotentialArtisan(irreps_in, cfg)
         assert isinstance(expert.gate, torch.nn.Parameter)
         assert expert.gate.requires_grad is True
         # Initial value should be 1.0
         assert expert.gate.item() == pytest.approx(1.0, abs=1e-12)
 
 
-class TestKronosMoE:
-    def _make_moe(
+class TestSimurghArtisanBank:
+    def _make_bank(
         self,
         elements: typing.Sequence[int] = (1, 6, 7, 8),
         irreps_in: str = "16x0e+16x1o+16x2e",
         cutoff: float = 5.0,
-    ) -> KronosMoE:
-        cfg = ExpertConfig(
+    ) -> SimurghArtisanBank:
+        cfg = ArtisanConfig(
             scalar_channels=8,
             hidden_dims=(32, 16),
             expert_type="linear",
         )
-        return KronosMoE(
+        return SimurghArtisanBank(
             elements=elements,
             irreps_in=irreps_in,
-            expert_config=cfg,
+            artisan_config=cfg,
             cutoff=cutoff,
         ).double()
 
-    def test_num_experts_matches_pair_count(self) -> None:
-        moe = self._make_moe(elements=(1, 6, 7, 8))
+    def test_num_artisans_matches_pair_count(self) -> None:
+        artisan_bank = self._make_bank(elements=(1, 6, 7, 8))
         # K = 4 → 4 * 5 / 2 = 10
-        assert moe.num_experts == 10
+        assert artisan_bank.num_artisans == 10
         # Three-element set
-        moe3 = self._make_moe(elements=(1, 6, 8))
-        assert moe3.num_experts == 6
+        bank3 = self._make_bank(elements=(1, 6, 8))
+        assert bank3.num_artisans == 6
 
     def test_every_pair_has_a_gate(self) -> None:
-        moe = self._make_moe()
-        gate_names: list[str] = [n for n, _ in moe.named_parameters() if n.endswith(".gate")]
+        artisan_bank = self._make_bank()
+        gate_names: list[str] = [n for n, _ in artisan_bank.named_parameters() if n.endswith(".gate")]
         # 10 unordered pairs in HCNO
         assert len(gate_names) == 10
         # Pair keys use ``z{lo}_z{hi}``
-        assert "experts.z1_z6.gate" in gate_names
-        assert "experts.z8_z8.gate" in gate_names
+        assert "artisans.z1_z6.gate" in gate_names
+        assert "artisans.z8_z8.gate" in gate_names
 
     def test_forward_runs_with_all_pair_types(self, methylamine_batch) -> None:  # noqa: ANN001
-        moe = self._make_moe()
+        artisan_bank = self._make_bank()
         n_atoms = methylamine_batch.num_atoms
-        feats = torch.randn(n_atoms, moe._irreps_in.dim, dtype=torch.float64)
-        energies = moe(
+        feats = torch.randn(n_atoms, artisan_bank._irreps_in.dim, dtype=torch.float64)
+        energies = artisan_bank(
             atom_features=feats,
             atomic_numbers=methylamine_batch.atomic_numbers,
             edge_index=methylamine_batch.edge_index,
@@ -174,10 +174,10 @@ class TestKronosMoE:
     def test_zero_mask_runs_absent_pairs(self, water_batch) -> None:  # noqa: ANN001
         """Water has only H and O — N-containing experts must still execute
         (their gate parameters must be in the autograd graph)."""
-        moe = self._make_moe()
+        artisan_bank = self._make_bank()
         n_atoms = water_batch.num_atoms
-        feats = torch.randn(n_atoms, moe._irreps_in.dim, dtype=torch.float64)
-        energies = moe(
+        feats = torch.randn(n_atoms, artisan_bank._irreps_in.dim, dtype=torch.float64)
+        energies = artisan_bank(
             atom_features=feats,
             atomic_numbers=water_batch.atomic_numbers,
             edge_index=water_batch.edge_index,
@@ -185,7 +185,7 @@ class TestKronosMoE:
         )
         loss = energies.sum()
         loss.backward()
-        for name, p in moe.named_parameters():
+        for name, p in artisan_bank.named_parameters():
             if name.endswith(".gate"):
                 assert p.grad is not None, f"gate {name} got no gradient"
 
@@ -193,7 +193,7 @@ class TestKronosMoE:
 class TestZeroMaskCCOnly:
     """CHANGE 3 acceptance test.
 
-    On a C-C-only batch with KRONOS configured for H/C/N/O:
+    On a C-C-only batch with SIMURGH configured for H/C/N/O:
 
     1. All 10 experts execute (their parameters are reachable from the
        loss / appear in the autograd graph).
@@ -203,16 +203,16 @@ class TestZeroMaskCCOnly:
        absent experts leaves the energy unchanged.
     """
 
-    def _make_moe(self) -> KronosMoE:
-        cfg = ExpertConfig(
+    def _make_bank(self) -> SimurghArtisanBank:
+        cfg = ArtisanConfig(
             scalar_channels=8,
             hidden_dims=(32, 16),
             expert_type="linear",
         )
-        return KronosMoE(
+        return SimurghArtisanBank(
             elements=(1, 6, 7, 8),
             irreps_in="16x0e+16x1o+16x2e",
-            expert_config=cfg,
+            artisan_config=cfg,
             cutoff=5.0,
         ).double()
 
@@ -220,12 +220,12 @@ class TestZeroMaskCCOnly:
         self,
         carbon_dimer_batch,  # noqa: ANN001
     ) -> None:
-        moe = self._make_moe()
+        artisan_bank = self._make_bank()
         n_atoms = carbon_dimer_batch.num_atoms
-        feats = torch.randn(n_atoms, moe._irreps_in.dim, dtype=torch.float64)
+        feats = torch.randn(n_atoms, artisan_bank._irreps_in.dim, dtype=torch.float64)
 
         # Use the diagnostic return-per-pair path
-        atom_energies, per_pair = moe(
+        atom_energies, per_pair = artisan_bank(
             atom_features=feats,
             atomic_numbers=carbon_dimer_batch.atomic_numbers,
             edge_index=carbon_dimer_batch.edge_index,
@@ -266,24 +266,24 @@ class TestZeroMaskCCOnly:
         """Tamper with every non-CC gate (set it to 1e10) and verify the
         total energy is unchanged.  If the mask leaked, the energy would
         explode."""
-        moe = self._make_moe()
+        artisan_bank = self._make_bank()
         n_atoms = carbon_dimer_batch.num_atoms
-        feats = torch.randn(n_atoms, moe._irreps_in.dim, dtype=torch.float64)
+        feats = torch.randn(n_atoms, artisan_bank._irreps_in.dim, dtype=torch.float64)
 
-        e_before: torch.Tensor = moe(
+        e_before: torch.Tensor = artisan_bank(
             atom_features=feats,
             atomic_numbers=carbon_dimer_batch.atomic_numbers,
             edge_index=carbon_dimer_batch.edge_index,
             edge_lengths=carbon_dimer_batch.edge_weight,
         )
 
-        cc_key = KronosMoE._key(6, 6)
+        cc_key = SimurghArtisanBank._key(6, 6)
         with torch.no_grad():
-            for key, expert in moe.experts.items():
+            for key, expert in artisan_bank.artisans.items():
                 if key != cc_key:
                     expert.gate.fill_(1.0e10)
 
-        e_after: torch.Tensor = moe(
+        e_after: torch.Tensor = artisan_bank(
             atom_features=feats,
             atomic_numbers=carbon_dimer_batch.atomic_numbers,
             edge_index=carbon_dimer_batch.edge_index,
@@ -302,11 +302,11 @@ class TestZeroMaskCCOnly:
         """On a C-C-only batch every one of the 10 experts must have a
         registered (possibly zero-valued) gradient after backward — the
         static-shape schedule keeps every expert in the autograd graph."""
-        moe = self._make_moe()
+        artisan_bank = self._make_bank()
         n_atoms = carbon_dimer_batch.num_atoms
-        feats = torch.randn(n_atoms, moe._irreps_in.dim, dtype=torch.float64, requires_grad=True)
+        feats = torch.randn(n_atoms, artisan_bank._irreps_in.dim, dtype=torch.float64, requires_grad=True)
 
-        energies: torch.Tensor = moe(
+        energies: torch.Tensor = artisan_bank(
             atom_features=feats,
             atomic_numbers=carbon_dimer_batch.atomic_numbers,
             edge_index=carbon_dimer_batch.edge_index,
@@ -314,14 +314,14 @@ class TestZeroMaskCCOnly:
         )
         energies.sum().backward()
 
-        for key in moe.experts.keys():
-            expert: PairwiseExpert = typing.cast(PairwiseExpert, moe.experts[key])
+        for key in artisan_bank.artisans.keys():
+            expert: PotentialArtisan = typing.cast(PotentialArtisan, artisan_bank.artisans[key])
             assert expert.gate.grad is not None, (
                 f"Gate of expert {key} did not appear in the autograd graph — "
                 f"the zero-mask schedule must keep every expert reachable"
             )
             # For absent experts the gradient should be exactly zero
-            if key != KronosMoE._key(6, 6):
+            if key != SimurghArtisanBank._key(6, 6):
                 assert expert.gate.grad.item() == 0.0, (
                     f"Absent expert {key} received a non-zero gradient "
                     f"({expert.gate.grad.item()!r}) — zero-masking is broken"
@@ -329,12 +329,12 @@ class TestZeroMaskCCOnly:
 
 
 # ---------------------------------------------------------------------------
-# CHANGE 4: Data-driven routing — RarePairExpert
+# CHANGE 4: Data-driven routing — RarePotentialArtisan
 # ---------------------------------------------------------------------------
 
 
 class TestRarePairRouting:
-    """Tests for ``rare_pair_enabled=True`` routing in ``KronosMoE``."""
+    """Tests for ``rare_pair_enabled=True`` routing in ``SimurghArtisanBank``."""
 
     # H/C/O elements: pairs are (H-H, H-C, H-O, C-C, C-O, O-O) = 6 total.
     # We make H-H and O-O "rare" by giving them tiny counts.
@@ -352,17 +352,17 @@ class TestRarePairRouting:
             (8, 8): 1,  # rare  (~0.09 %)
         }  # total ≈ 1103 directed edges
 
-    def _make_moe_with_routing(self) -> KronosMoE:
-        cfg = ExpertConfig(
+    def _make_bank_with_routing(self) -> SimurghArtisanBank:
+        cfg = ArtisanConfig(
             scalar_channels=8,
             hidden_dims=(16,),
             expert_type="linear",
             rare_pair_embed_dim=4,
         )
-        return KronosMoE(
+        return SimurghArtisanBank(
             elements=self._ELEMENTS,
             irreps_in=self._IRREPS_IN,
-            expert_config=cfg,
+            artisan_config=cfg,
             cutoff=5.0,
             pair_counts=self._pair_counts_hco(),
             rare_pair_enabled=True,
@@ -370,37 +370,37 @@ class TestRarePairRouting:
         ).double()
 
     def test_common_pairs_have_dedicated_experts(self) -> None:
-        moe = self._make_moe_with_routing()
-        # H-C, H-O, C-C are common → dedicated PairwiseExperts
+        artisan_bank = self._make_bank_with_routing()
+        # H-C, H-O, C-C are common → dedicated PotentialArtisans
         for a, b in [(1, 6), (1, 8), (6, 6)]:
-            key = KronosMoE._key(a, b)
+            key = SimurghArtisanBank._key(a, b)
             assert (
-                key in moe.experts
-            ), f"Common pair {(a,b)} should have a dedicated PairwiseExpert."
+                key in artisan_bank.artisans
+            ), f"Common pair {(a,b)} should have a dedicated PotentialArtisan."
 
-    def test_rare_pairs_go_to_rare_expert(self) -> None:
-        moe = self._make_moe_with_routing()
-        rare_pairs = set(moe._rare_pairs)
-        # H-H, C-O, O-O are below 1% → handled by RarePairExpert
+    def test_rare_pairs_go_to_rare_artisan(self) -> None:
+        artisan_bank = self._make_bank_with_routing()
+        rare_pairs = set(artisan_bank._rare_pairs)
+        # H-H, C-O, O-O are below 1% → handled by RarePotentialArtisan
         for p in [(1, 1), (6, 8), (8, 8)]:
             assert p in rare_pairs, f"Pair {p} should be classified as rare (freq < 1%)."
 
-    def test_rare_expert_is_not_none(self) -> None:
-        moe = self._make_moe_with_routing()
-        assert moe.rare_expert is not None
+    def test_rare_artisan_is_not_none(self) -> None:
+        artisan_bank = self._make_bank_with_routing()
+        assert artisan_bank.rare_artisan_module is not None
 
-    def test_num_experts_dedicated_plus_one_shared(self) -> None:
-        moe = self._make_moe_with_routing()
-        n_dedicated = len(moe._dedicated_pairs)
-        # num_experts = dedicated + 1 (the shared RarePairExpert)
-        assert moe.num_experts == n_dedicated + 1
+    def test_num_artisans_dedicated_plus_one_shared(self) -> None:
+        artisan_bank = self._make_bank_with_routing()
+        n_dedicated = len(artisan_bank._dedicated_pairs)
+        # num_artisans = dedicated + 1 (the shared RarePotentialArtisan)
+        assert artisan_bank.num_artisans == n_dedicated + 1
 
     def test_forward_runs_on_hco_batch(self, methane_batch) -> None:  # noqa: ANN001
-        """Smoke test: routed MoE runs on a batch with H and C only."""
-        moe = self._make_moe_with_routing()
+        """Smoke test: routed artisan bank runs on a batch with H and C only."""
+        artisan_bank = self._make_bank_with_routing()
         n = methane_batch.num_atoms
         feats = torch.randn(n, Irreps(self._IRREPS_IN).dim, dtype=torch.float64)
-        energies = moe(
+        energies = artisan_bank(
             atom_features=feats,
             atomic_numbers=methane_batch.atomic_numbers,
             edge_index=methane_batch.edge_index,
@@ -409,17 +409,17 @@ class TestRarePairRouting:
         assert energies.shape == (n,)
         assert torch.isfinite(energies).all()
 
-    def test_rare_expert_parameters_receive_gradient(self, water_batch) -> None:
+    def test_rare_artisan_parameters_receive_gradient(self, water_batch) -> None:
         """Backward through a batch containing rare O-O pairs (water = O + 2H).
 
         Water contains only H-H, H-O, and O-O pairs.  H-H and O-O are rare in
-        our pair_counts, so the rare_expert must fire — its parameters must
+        our pair_counts, so the rare_artisan_module must fire — its parameters must
         receive gradients.
         """
-        moe = self._make_moe_with_routing()
+        artisan_bank = self._make_bank_with_routing()
         n = water_batch.num_atoms
         feats = torch.randn(n, Irreps(self._IRREPS_IN).dim, dtype=torch.float64)
-        energies = moe(
+        energies = artisan_bank(
             atom_features=feats,
             atomic_numbers=water_batch.atomic_numbers,
             edge_index=water_batch.edge_index,
@@ -427,40 +427,40 @@ class TestRarePairRouting:
         )
         energies.sum().backward()
 
-        assert moe.rare_expert is not None
+        assert artisan_bank.rare_artisan_module is not None
         # The shared backbone parameters must have gotten gradients
         backbone_grads = [
-            p.grad for name, p in moe.rare_expert.named_parameters() if p.grad is not None
+            p.grad for name, p in artisan_bank.rare_artisan_module.named_parameters() if p.grad is not None
         ]
         assert backbone_grads, (
-            "RarePairExpert parameters received no gradient — "
+            "RarePotentialArtisan parameters received no gradient — "
             "the rare-pair path is disconnected from the autograd graph."
         )
 
     def test_no_routing_when_disabled(self) -> None:
-        """With rare_pair_enabled=False, all pairs get dedicated experts."""
-        cfg = ExpertConfig(
+        """With rare_pair_enabled=False, all pairs get dedicated artisans."""
+        cfg = ArtisanConfig(
             scalar_channels=8,
             hidden_dims=(16,),
             expert_type="linear",
         )
-        moe = KronosMoE(
+        artisan_bank = SimurghArtisanBank(
             elements=self._ELEMENTS,
             irreps_in=self._IRREPS_IN,
-            expert_config=cfg,
+            artisan_config=cfg,
             cutoff=5.0,
             pair_counts=self._pair_counts_hco(),
             rare_pair_enabled=False,
         ).double()
-        assert len(moe._rare_pairs) == 0
-        assert moe.rare_expert is None
+        assert len(artisan_bank._rare_pairs) == 0
+        assert artisan_bank.rare_artisan_module is None
         # K=3 → 6 pairs, all dedicated
-        assert moe.num_experts == 6
+        assert artisan_bank.num_artisans == 6
 
     @requires_gmd
     def test_routing_on_gmd_hco_batch(self, gmd_batch) -> None:  # noqa: ANN001
-        """Smoke test: routed MoE runs on real GMD batch (H, C, O atoms)."""
-        cfg = ExpertConfig(
+        """Smoke test: routed artisan bank runs on real GMD batch (H, C, O atoms)."""
+        cfg = ArtisanConfig(
             scalar_channels=8,
             hidden_dims=(16,),
             expert_type="linear",
@@ -475,10 +475,10 @@ class TestRarePairRouting:
             (6, 8): 2,
             (8, 8): 1,
         }
-        moe = KronosMoE(
+        artisan_bank = SimurghArtisanBank(
             elements=(1, 6, 8),
             irreps_in="8x0e+8x1o",
-            expert_config=cfg,
+            artisan_config=cfg,
             cutoff=5.0,
             pair_counts=pair_counts,
             rare_pair_enabled=True,
@@ -490,7 +490,7 @@ class TestRarePairRouting:
             Irreps("8x0e+8x1o").dim,
             dtype=torch.float64,
         )
-        energies = moe(
+        energies = artisan_bank(
             atom_features=feats,
             atomic_numbers=gmd_batch.atomic_numbers,
             edge_index=gmd_batch.edge_index,
@@ -500,13 +500,13 @@ class TestRarePairRouting:
         assert torch.isfinite(energies).all()
 
 
-class TestRarePairExpertModule:
-    """Direct unit tests for the :class:`RarePairExpert` module."""
+class TestRarePotentialArtisanModule:
+    """Direct unit tests for the :class:`RarePotentialArtisan` module."""
 
     def test_output_shape(self) -> None:
         irreps_in = Irreps("8x0e+8x1o")
-        cfg = ExpertConfig(scalar_channels=8, hidden_dims=(16,), rare_pair_embed_dim=4)
-        expert = RarePairExpert(irreps_in, [(1, 6), (6, 8)], cfg).double()
+        cfg = ArtisanConfig(scalar_channels=8, hidden_dims=(16,), rare_pair_embed_dim=4)
+        expert = RarePotentialArtisan(irreps_in, [(1, 6), (6, 8)], cfg).double()
 
         n = 5
         scalars_a = torch.randn(n, 8, dtype=torch.float64)
@@ -520,24 +520,24 @@ class TestRarePairExpertModule:
 
     def test_gates_are_parameters(self) -> None:
         irreps_in = Irreps("4x0e")
-        cfg = ExpertConfig(scalar_channels=4, hidden_dims=(8,), rare_pair_embed_dim=4)
-        expert = RarePairExpert(irreps_in, [(1, 1), (8, 8)], cfg)
+        cfg = ArtisanConfig(scalar_channels=4, hidden_dims=(8,), rare_pair_embed_dim=4)
+        expert = RarePotentialArtisan(irreps_in, [(1, 1), (8, 8)], cfg)
         assert isinstance(expert.gates, torch.nn.Parameter)
         assert expert.gates.shape == (2,)
         assert expert.gates.requires_grad
 
     def test_requires_at_least_one_pair(self) -> None:
         irreps_in = Irreps("4x0e")
-        cfg = ExpertConfig(scalar_channels=4, hidden_dims=(8,))
+        cfg = ArtisanConfig(scalar_channels=4, hidden_dims=(8,))
         with pytest.raises(ValueError, match="at least one pair"):
-            RarePairExpert(irreps_in, [], cfg)
+            RarePotentialArtisan(irreps_in, [], cfg)
 
     def test_different_pair_idx_gives_different_output(self) -> None:
         """Two edges with the same scalars/distance but different pair_local_idx
         should produce different outputs (the embedding distinguishes pairs)."""
         irreps_in = Irreps("8x0e")
-        cfg = ExpertConfig(scalar_channels=8, hidden_dims=(16,), rare_pair_embed_dim=8)
-        expert = RarePairExpert(irreps_in, [(1, 1), (8, 8)], cfg).double()
+        cfg = ArtisanConfig(scalar_channels=8, hidden_dims=(16,), rare_pair_embed_dim=8)
+        expert = RarePotentialArtisan(irreps_in, [(1, 1), (8, 8)], cfg).double()
 
         s = torch.randn(1, 8, dtype=torch.float64)
         d = torch.tensor([1.5], dtype=torch.float64)
@@ -549,6 +549,6 @@ class TestRarePairExpertModule:
             out_1 = expert(s, s, d, idx_1)
 
         assert not torch.allclose(out_0, out_1), (
-            "RarePairExpert returned identical outputs for different pair_local_idx — "
+            "RarePotentialArtisan returned identical outputs for different pair_local_idx — "
             "the per-pair embedding has no effect."
         )

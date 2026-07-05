@@ -9,6 +9,21 @@ Pools
 All checkpoint writes are atomic (write to .tmp then os.replace).
 Pool membership is persisted to checkpoint_state.json so resumed
 training can continue managing deletions correctly.
+
+Self-contained checkpoints
+--------------------------
+At ``on_train_start`` the manager freezes everything a checkpoint needs
+to be loadable forever, regardless of later source changes:
+
+* ``{dirpath}/frozen_source/`` — every ``goal`` .py file the model
+  imports (walked automatically, see :mod:`goal.ml.training.archive`)
+* ``{dirpath}/config.yaml``    — the fully resolved Hydra config
+* ``{dirpath}/metadata.json``  — version, git commit, elements, scale, …
+
+Every ``.ckpt`` write also gets a small ``.json`` sidecar recording the
+epoch, metrics, and pool it came from.  At ``on_train_end`` (and
+optionally at every interval checkpoint) the best checkpoint is packed
+into a single shippable ``.simurgh`` archive.
 """
 
 from __future__ import annotations
@@ -18,11 +33,20 @@ import logging
 import os
 import warnings
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import lightning as L
 from lightning import Callback
+
+from goal.ml.training.archive import (
+    ARCHIVE_SUFFIX,
+    FROZEN_SOURCE_DIRNAME,
+    freeze_model_source,
+    gather_model_metadata,
+    pack_simurgh_archive,
+)
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +102,12 @@ class GOALCheckpointManager(Callback):
         Config dict for pool 2.  Keys: ``enabled``, ``every_n_epochs``, ``keep_last_n``.
     last:
         Config dict for pool 3.  Keys: ``enabled``, ``filename``.
+    save_archive:
+        Pack the best top-k checkpoint into ``{dirpath}/best_{metric}.simurgh``
+        at the end of training.
+    archive_interval:
+        Also pack a ``.simurgh`` archive for every interval checkpoint
+        (evicted together with its checkpoint).
     """
 
     def __init__(
@@ -86,10 +116,14 @@ class GOALCheckpointManager(Callback):
         top_k: dict[str, Any] | None = None,
         interval: dict[str, Any] | None = None,
         last: dict[str, Any] | None = None,
+        save_archive: bool = True,
+        archive_interval: bool = False,
     ) -> None:
         super().__init__()
 
         self._dirpath: str | None = dirpath
+        self.save_archive: bool = bool(save_archive)
+        self.archive_interval: bool = bool(archive_interval)
 
         # --- Pool 1 config ---
         _tk = top_k or {}
@@ -150,6 +184,104 @@ class GOALCheckpointManager(Callback):
             self._load_state(state_path)
 
     # ------------------------------------------------------------------
+    # Source freezing — fires once, before the first training step
+    # ------------------------------------------------------------------
+
+    def on_train_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        """Freeze model source, resolved config, and metadata into dirpath.
+
+        Runs before any weights are saved, so every checkpoint written to
+        this directory is loadable from the frozen snapshot regardless of
+        later changes to the codebase.  On resume the existing snapshot is
+        kept — it matches the code the run *started* with.
+        """
+        if not trainer.is_global_zero or self._resolved_dirpath is None:
+            return
+
+        dirpath = Path(self._resolved_dirpath)
+        dirpath.mkdir(parents=True, exist_ok=True)
+        frozen_dir = dirpath / FROZEN_SOURCE_DIRNAME
+
+        if frozen_dir.exists():
+            log.info(
+                "[ckpt/freeze] %s already exists — keeping the snapshot from "
+                "the original training start (resume detected).",
+                frozen_dir,
+            )
+            return
+
+        try:
+            frozen_files = freeze_model_source(pl_module, frozen_dir)
+            self._save_resolved_config(dirpath, pl_module)
+            self._save_metadata(dirpath, pl_module)
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "[ckpt/freeze] FAILED to freeze model source into %s. "
+                "Training continues, but checkpoints in this directory will "
+                "NOT be self-contained.",
+                dirpath,
+            )
+            return
+
+        log.info(
+            "Model source frozen to %s/ (%d files)\n"
+            "Config saved to %s\n"
+            "All checkpoints in this directory are self-contained.",
+            frozen_dir,
+            len(frozen_files),
+            dirpath / "config.yaml",
+        )
+
+    def _save_resolved_config(self, dirpath: Path, pl_module: L.LightningModule) -> None:
+        """Write the fully resolved Hydra config to ``{dirpath}/config.yaml``."""
+        cfg = getattr(pl_module, "config", None)
+        if cfg is None:
+            log.warning("[ckpt/freeze] pl_module has no .config — config.yaml not written.")
+            return
+        from omegaconf import OmegaConf
+
+        try:
+            text = OmegaConf.to_yaml(cfg, resolve=True)
+        except Exception:  # noqa: BLE001 — unresolvable interpolations
+            log.warning(
+                "[ckpt/freeze] Config has unresolvable interpolations — "
+                "saving config.yaml unresolved."
+            )
+            text = OmegaConf.to_yaml(cfg, resolve=False)
+        tmp = dirpath / "config.yaml.tmp"
+        tmp.write_text(text)
+        os.replace(tmp, dirpath / "config.yaml")
+
+    def _save_metadata(self, dirpath: Path, pl_module: L.LightningModule) -> None:
+        """Write provenance metadata to ``{dirpath}/metadata.json``."""
+        model = getattr(pl_module, "backbone", None) or pl_module
+        metadata = gather_model_metadata(model)
+        tmp = dirpath / "metadata.json.tmp"
+        with open(tmp, "w") as f:
+            json.dump(metadata, f, indent=2)
+        os.replace(tmp, dirpath / "metadata.json")
+
+    def on_train_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        """Pack the best top-k checkpoint into a ``.simurgh`` archive."""
+        if not trainer.is_global_zero or self._resolved_dirpath is None:
+            return
+        if not self.save_archive:
+            return
+        if not self._top_k_pool:
+            log.info("[archive] No top-k checkpoints — skipping end-of-training archive.")
+            return
+
+        pick = max if self.top_k_mode == "max" else min
+        _, best_path = pick(self._top_k_pool, key=lambda t: t[0])
+        metric_slug = self.top_k_metric.replace("/", "_")
+        output = Path(self._resolved_dirpath) / f"best_{metric_slug}{ARCHIVE_SUFFIX}"
+        try:
+            pack_simurgh_archive(best_path, output)
+            log.info("[archive] Best checkpoint packed to %s", output)
+        except Exception:  # noqa: BLE001
+            log.exception("[archive] Failed to pack end-of-training archive %s", output)
+
+    # ------------------------------------------------------------------
     # Main hook
     # ------------------------------------------------------------------
 
@@ -168,11 +300,11 @@ class GOALCheckpointManager(Callback):
 
         # Pool 2 — interval
         if self.interval_enabled and (epoch % self.interval_every_n == 0):
-            self._update_interval(trainer, epoch)
+            self._update_interval(trainer, epoch, metrics)
 
         # Pool 3 — always save last
         if self.last_enabled:
-            self._update_last(trainer)
+            self._update_last(trainer, epoch, metrics)
 
         # Persist pool state after every epoch
         self._save_state()
@@ -204,6 +336,7 @@ class GOALCheckpointManager(Callback):
         if len(self._top_k_pool) < self.top_k_k:
             # Pool not full yet — always save
             self._save_atomic(trainer, filepath)
+            self._write_sidecar(filepath, epoch, metrics, pool="top_k")
             self._top_k_pool.append((value, filepath))
             log.info(
                 "[ckpt/top_k] Saved %s (pool size %d/%d)",
@@ -218,9 +351,10 @@ class GOALCheckpointManager(Callback):
             if _is_better(value, worst_value, self.top_k_mode):
                 # New checkpoint is better than the worst — save and evict
                 self._save_atomic(trainer, filepath)
+                self._write_sidecar(filepath, epoch, metrics, pool="top_k")
                 # Only delete if the file is not also in the interval pool
                 if worst_path not in self._interval_pool:
-                    _delete_file(worst_path)
+                    _delete_checkpoint(worst_path)
                     log.info("[ckpt/top_k] Evicted %s", Path(worst_path).name)
                 else:
                     log.info(
@@ -241,7 +375,7 @@ class GOALCheckpointManager(Callback):
     # Pool 2
     # ------------------------------------------------------------------
 
-    def _update_interval(self, trainer: L.Trainer, epoch: int) -> None:
+    def _update_interval(self, trainer: L.Trainer, epoch: int, metrics: dict[str, Any]) -> None:
         filename = f"interval_epoch={epoch:04d}.ckpt"
         filepath = str(Path(self._resolved_dirpath) / filename)
 
@@ -251,16 +385,19 @@ class GOALCheckpointManager(Callback):
             # Only delete if not in top-k pool
             top_k_paths = {p for _, p in self._top_k_pool}
             if oldest_path not in top_k_paths:
-                _delete_file(oldest_path)
+                _delete_checkpoint(oldest_path)
                 log.info("[ckpt/interval] Evicted %s", Path(oldest_path).name)
             else:
                 log.info(
                     "[ckpt/interval] Evicted from interval but kept (in top-k pool): %s",
                     Path(oldest_path).name,
                 )
+            # The interval archive tracks its checkpoint's lifetime either way
+            _delete_file(str(Path(oldest_path).with_suffix(ARCHIVE_SUFFIX)))
             self._interval_pool.popleft()
 
         self._save_atomic(trainer, filepath)
+        self._write_sidecar(filepath, epoch, metrics, pool="interval")
         self._interval_pool.append(filepath)
         log.info(
             "[ckpt/interval] Saved %s (pool size %d/%d)",
@@ -269,13 +406,20 @@ class GOALCheckpointManager(Callback):
             self.interval_keep_n,
         )
 
+        if self.archive_interval:
+            try:
+                pack_simurgh_archive(filepath, Path(filepath).with_suffix(ARCHIVE_SUFFIX))
+            except Exception:  # noqa: BLE001
+                log.exception("[archive] Failed to pack interval archive for %s", filename)
+
     # ------------------------------------------------------------------
     # Pool 3
     # ------------------------------------------------------------------
 
-    def _update_last(self, trainer: L.Trainer) -> None:
+    def _update_last(self, trainer: L.Trainer, epoch: int, metrics: dict[str, Any]) -> None:
         filepath = str(Path(self._resolved_dirpath) / self.last_filename)
         self._save_atomic(trainer, filepath)
+        self._write_sidecar(filepath, epoch, metrics, pool="last")
         self._last_ckpt_path = filepath
 
     # ------------------------------------------------------------------
@@ -287,6 +431,53 @@ class GOALCheckpointManager(Callback):
         tmp_path = filepath + ".tmp"
         trainer.save_checkpoint(tmp_path)
         os.replace(tmp_path, filepath)
+
+    # ------------------------------------------------------------------
+    # Per-checkpoint sidecar
+    # ------------------------------------------------------------------
+
+    def _write_sidecar(
+        self,
+        filepath: str,
+        epoch: int,
+        metrics: dict[str, Any],
+        pool: str,
+    ) -> None:
+        """Write ``<ckpt>.json`` next to ``<ckpt>.ckpt``.
+
+        Records the epoch, every scalar metric, the pool the checkpoint
+        belongs to, and paths (relative to the sidecar itself, so the
+        directory stays relocatable) to the shared config / frozen source
+        / metadata written at training start.
+        """
+        sidecar_path = Path(filepath).with_suffix(".json")
+        dirpath = sidecar_path.parent
+
+        scalar_metrics: dict[str, float] = {}
+        for key, value in metrics.items():
+            try:
+                scalar_metrics[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+
+        payload: dict[str, Any] = {
+            "epoch": int(epoch),
+            "pool": pool,
+            "metrics": scalar_metrics,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "config_path": os.path.relpath(dirpath / "config.yaml", start=dirpath),
+            "frozen_source_path": os.path.relpath(dirpath / FROZEN_SOURCE_DIRNAME, start=dirpath)
+            + "/",
+            "metadata_path": os.path.relpath(dirpath / "metadata.json", start=dirpath),
+        }
+
+        tmp = str(sidecar_path) + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(payload, f, indent=2)
+            os.replace(tmp, str(sidecar_path))
+        except OSError as exc:
+            log.warning("[ckpt/sidecar] Could not write %s: %s", sidecar_path, exc)
 
     # ------------------------------------------------------------------
     # State persistence
@@ -428,3 +619,9 @@ def _delete_file(path: str) -> None:
         pass
     except OSError as exc:
         log.warning("GOALCheckpointManager: could not delete %s: %s", path, exc)
+
+
+def _delete_checkpoint(path: str) -> None:
+    """Delete a checkpoint together with its .json sidecar."""
+    _delete_file(path)
+    _delete_file(str(Path(path).with_suffix(".json")))

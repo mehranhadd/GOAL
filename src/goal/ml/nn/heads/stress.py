@@ -92,7 +92,7 @@ class StressHead(nn.Module):
             # storage cost.
             edge_vectors_stored: torch.Tensor | None = graph.get("edge_attr", None)
             if edge_vectors_stored is None:
-                from goal.ml.nn.models.kronos.geometry import differentiable_edges
+                from goal.ml.nn.models.simurgh.geometry import differentiable_edges
 
                 edge_vectors_stored, _ = differentiable_edges(graph, graph.pos)
             virial = torch.einsum(  # (E, 3, 3)

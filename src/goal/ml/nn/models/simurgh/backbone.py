@@ -1,17 +1,17 @@
-"""Modular KRONOS backbone.
+"""Modular SIMURGH backbone.
 
-KRONOS = **K-order Routed Orthogonal Network of Symmetry with
-Element-Pair Mixture-of-Experts.**
+SIMURGH — equivariant force field with an **element-pair bank of
+potential artisans** (a routed mixture of pairwise energy modules).
 
 The backbone produces ``NodeFeatures`` where ``node_energies`` is
-already populated with the per-atom MoE energy contributions.  Heads
+already populated with the per-atom artisan-bank energy contributions.  Heads
 that respect this (``energy``, ``energy_forces``, ``dual_forces``)
 simply sum the populated channel; otherwise heads fall back to the
 standard scalar-readout pathway.
 
-This is the **default** variant of KRONOS in the project; a fully
+This is the **default** variant of SIMURGH in the project; a fully
 self-contained monolithic counterpart lives in
-``goal.ml.nn.models.kronos.monolithic``.
+``goal.ml.nn.models.simurgh.monolithic``.
 """
 
 from __future__ import annotations
@@ -25,15 +25,15 @@ from lightning.pytorch.utilities.rank_zero import rank_zero_info
 
 from goal.ml.data.graph import AtomicGraph, NodeFeatures
 from goal.ml.nn.blocks.env_dressing import EnvironmentDressing
-from goal.ml.nn.blocks.experts import ExpertConfig, KronosMoE, RarePairExpert
-from goal.ml.nn.models.kronos.geometry import differentiable_edges
+from goal.ml.nn.blocks.artisans import ArtisanConfig, SimurghArtisanBank
+from goal.ml.nn.models.simurgh.geometry import differentiable_edges
 from goal.ml.registry import BACKBONE_REGISTRY, MODEL_REGISTRY
 
 
-@MODEL_REGISTRY.register("kronos")
-@BACKBONE_REGISTRY.register("kronos")
-class KronosBackbone(nn.Module):
-    """KRONOS backbone — environment dressing + element-pair MoE.
+@MODEL_REGISTRY.register("simurgh")
+@BACKBONE_REGISTRY.register("simurgh")
+class SimurghBackbone(nn.Module):
+    """SIMURGH backbone — environment dressing + element-pair artisan bank.
 
     Two-stage architecture:
 
@@ -52,7 +52,7 @@ class KronosBackbone(nn.Module):
        (DDP-safe).
 
     The block emits ``NodeFeatures`` whose ``node_energies`` field
-    already holds the per-atom MoE energy contributions, so downstream
+    already holds the per-atom artisan-bank energy contributions, so downstream
     heads can either pick them up directly (``EnergyHead`` /
     ``EnergyForcesHead`` / ``DualForcesHead`` recognise the field) or
     apply their own readout to the dressed features.
@@ -65,8 +65,8 @@ class KronosBackbone(nn.Module):
     dressing_kwargs : dict
         Forwarded to :class:`EnvironmentDressing` — see its docstring.
         Includes ``body_order`` for the ACE body-order expansion.
-    expert_config : dict
-        Forwarded to :class:`ExpertConfig` — see its docstring.
+    artisan_config : dict
+        Forwarded to :class:`ArtisanConfig` — see its docstring.
     cutoff : float
         Cosine-cutoff radius for the pairwise experts (Angstrom).
         Defaults to the dressing cutoff.
@@ -93,7 +93,7 @@ class KronosBackbone(nn.Module):
         null), ``compute_from_dataset`` (bool, redundant convenience
         that mirrors ``mode == "dataset"``).
     scale : float, optional
-        Multiplicative gain applied to the MoE interaction energy
+        Multiplicative gain applied to the artisan bank interaction energy
         before it is added to the atomic baseline.  Set from
         :func:`goal.ml.data.statistics.compute_energy_scale` on the
         training set.  Defaults to ``1.0`` (no gain).
@@ -119,7 +119,7 @@ class KronosBackbone(nn.Module):
         self,
         elements: typing.Sequence[int] = (1, 6, 7, 8),
         dressing_kwargs: dict[str, typing.Any] | None = None,
-        expert_config: dict[str, typing.Any] | None = None,
+        artisan_config: dict[str, typing.Any] | None = None,
         cutoff: float | None = None,
         atomic_energies: dict[str, typing.Any] | None = None,
         scale: float | None = None,
@@ -128,48 +128,55 @@ class KronosBackbone(nn.Module):
     ) -> None:
         super().__init__()
         dressing_cfg: dict[str, typing.Any] = dict(dressing_kwargs or {})
-        expert_cfg: dict[str, typing.Any] = dict(expert_config or {})
+        artisan_cfg: dict[str, typing.Any] = dict(artisan_config or {})
 
         self.dressing: EnvironmentDressing = EnvironmentDressing(**dressing_cfg)
-        moe_cutoff: float = cutoff if cutoff is not None else self.dressing.cutoff
+        bank_cutoff: float = cutoff if cutoff is not None else self.dressing.cutoff
 
         # Extract nested rare-pair config (CHANGE 4).
-        # Config layout: expert_config.rare_pair_expert.{enabled, pair_embed_dim,
-        # min_pair_frequency}.  Pop it before building ExpertConfig so the
+        # Config layout: artisan_config.rare_artisan.{enabled, pair_embed_dim,
+        # min_pair_frequency}.  Pop it before building ArtisanConfig so the
         # dataclass constructor doesn't see the unknown key.
-        ge_cfg: dict[str, typing.Any] = dict(expert_cfg.pop("rare_pair_expert", {}) or {})
+        ge_cfg: dict[str, typing.Any] = dict(artisan_cfg.pop("rare_artisan", {}) or {})
         rare_pair_enabled: bool = bool(ge_cfg.get("enabled", False))
         min_pair_frequency: float = float(ge_cfg.get("min_pair_frequency", 0.01))
         rare_pair_embed_dim: int = int(ge_cfg.get("pair_embed_dim", 16))
-        expert_cfg["rare_pair_embed_dim"] = rare_pair_embed_dim
+        artisan_cfg["rare_pair_embed_dim"] = rare_pair_embed_dim
 
         # Normalise tuple-typed config entries that may arrive as ListConfig
-        if "hidden_dims" in expert_cfg:
-            expert_cfg["hidden_dims"] = tuple(int(x) for x in expert_cfg["hidden_dims"])
+        if "hidden_dims" in artisan_cfg:
+            artisan_cfg["hidden_dims"] = tuple(int(x) for x in artisan_cfg["hidden_dims"])
+
+        # Normalise the nested equivariant sub-config (may arrive as an
+        # OmegaConf DictConfig) to a plain dict for ArtisanConfig.
+        if artisan_cfg.get("equivariant") is not None:
+            artisan_cfg["equivariant"] = {
+                str(k): v for k, v in dict(artisan_cfg["equivariant"]).items()
+            }
 
         # pair_counts injected by train.py when rare_pair_enabled is True
         pair_counts: dict[tuple[int, int], int] | None = None
-        raw_pair_counts: typing.Any = expert_cfg.pop("pair_counts", None)
+        raw_pair_counts: typing.Any = artisan_cfg.pop("pair_counts", None)
         if raw_pair_counts is not None:
             pair_counts = {
                 (int(k[0]), int(k[1])): int(v) for k, v in dict(raw_pair_counts).items()
             }
 
-        self.moe: KronosMoE = KronosMoE(
+        self.artisan_bank: SimurghArtisanBank = SimurghArtisanBank(
             elements=elements,
             irreps_in=self.dressing.irreps_out,
-            expert_config=ExpertConfig(**expert_cfg),
-            cutoff=moe_cutoff,
+            artisan_config=ArtisanConfig(**artisan_cfg),
+            cutoff=bank_cutoff,
             pair_counts=pair_counts,
             rare_pair_enabled=rare_pair_enabled,
             min_pair_frequency=min_pair_frequency,
         )
 
-        self._elements: tuple[int, ...] = self.moe.elements
+        self._elements: tuple[int, ...] = self.artisan_bank.elements
         self._num_interactions: int = len(self.dressing.interactions)
         self._irreps_out: Irreps = self.dressing.irreps_out
 
-        # Whether to route the MoE through ``forward_pairwise`` and
+        # Whether to route the artisan bank through ``forward_pairwise`` and
         # populate ``NodeFeatures.node_forces`` (consumed by force
         # heads in pairwise mode — see ``DualForcesHead``).
         self._compute_pairwise_forces: bool = bool(compute_pairwise_forces)
@@ -194,7 +201,7 @@ class KronosBackbone(nn.Module):
         # ---- Startup summary ----
         d = self.dressing
         rank_zero_info(
-            f"[KRONOS] backbone initialised\n"
+            f"[SIMURGH] backbone initialised\n"
             f"  elements      : {list(self._elements)}\n"
             f"  irreps_hidden : {d.irreps_out}  (lmax={d.lmax}, "
             f"channels={d.hidden_channels})\n"
@@ -207,9 +214,9 @@ class KronosBackbone(nn.Module):
             f"norm_exponent={d._agg_norm_exponent}\n"
             f"  atomic_E mode : {self._atomic_energies_mode}  "
             f"scale={scale_val:.4g}\n"
-            f"  experts       : {self.moe.num_experts} modules  "
-            f"(dedicated={len(self.moe._dedicated_pairs)}, "
-            f"rare={len(self.moe._rare_pairs)})"
+            f"  experts       : {self.artisan_bank.num_artisans} modules  "
+            f"(dedicated={len(self.artisan_bank._dedicated_pairs)}, "
+            f"rare={len(self.artisan_bank._rare_pairs)})"
         )
 
     def _init_atomic_energies(
@@ -321,8 +328,8 @@ class KronosBackbone(nn.Module):
         return self._elements
 
     @property
-    def num_experts(self) -> int:
-        return self.moe.num_experts
+    def num_artisans(self) -> int:
+        return self.artisan_bank.num_artisans
 
     @property
     def body_order(self) -> int:
@@ -336,13 +343,13 @@ class KronosBackbone(nn.Module):
 
     def gates(self) -> dict[str, torch.Tensor]:
         """Snapshot of every expert's gate parameter."""
-        return self.moe.gates()
+        return self.artisan_bank.gates()
 
-    def compute_expert_loads(
+    def compute_artisan_loads(
         self,
         graph: AtomicGraph,
     ) -> dict[str, torch.Tensor]:
-        """Delegate to :meth:`KronosMoE.compute_expert_loads` for the given batch.
+        """Delegate to :meth:`SimurghArtisanBank.compute_artisan_loads` for the given batch.
 
         Recomputes edge geometry (without requiring grad) so this can be
         called standalone after the main forward without touching the
@@ -350,12 +357,12 @@ class KronosBackbone(nn.Module):
         """
         import torch
 
-        from goal.ml.nn.models.kronos.geometry import differentiable_edges
+        from goal.ml.nn.models.simurgh.geometry import differentiable_edges
 
         with torch.no_grad():
             edge_vectors, edge_lengths = differentiable_edges(graph, graph.pos)
             edge_index = typing.cast(torch.Tensor, graph.edge_index)
-            return self.moe.compute_expert_loads(
+            return self.artisan_bank.compute_artisan_loads(
                 atom_features=self.dressing(
                     atomic_numbers=graph.atomic_numbers,
                     edge_index=edge_index,
@@ -367,6 +374,7 @@ class KronosBackbone(nn.Module):
                 atomic_numbers=graph.atomic_numbers,
                 edge_index=edge_index,
                 edge_lengths=edge_lengths,
+                edge_vectors=edge_vectors,
             )
 
     # ------------------------------------------------------------------
@@ -418,12 +426,12 @@ class KronosBackbone(nn.Module):
 
         # Pairwise expert energies (and, optionally, pairwise forces)
         # → per-atom interaction residual.  In the pairwise branch the
-        # MoE also returns ``F_per_atom`` built from per-pair
+        # artisan bank also returns ``F_per_atom`` built from per-pair
         # ``-∂E_ij/∂r_ij`` with Newton's third law applied at scatter
         # time.
         node_forces: torch.Tensor | None = None
         if self._compute_pairwise_forces:
-            interaction_energies, interaction_forces = self.moe.forward_pairwise(
+            interaction_energies, interaction_forces = self.artisan_bank.forward_pairwise(
                 atom_features=dressed,
                 atomic_numbers=graph.atomic_numbers,
                 edge_index=edge_index,
@@ -432,11 +440,12 @@ class KronosBackbone(nn.Module):
             scale_v: torch.Tensor = self.scale.to(interaction_energies.dtype)
             node_forces = scale_v * interaction_forces  # (N, 3)
         else:
-            interaction_energies = self.moe(
+            interaction_energies = self.artisan_bank(
                 atom_features=dressed,
                 atomic_numbers=graph.atomic_numbers,
                 edge_index=edge_index,
                 edge_lengths=edge_lengths,
+                edge_vectors=edge_vectors,
             )  # (N,)
             scale_v = self.scale.to(interaction_energies.dtype)
 
@@ -447,7 +456,7 @@ class KronosBackbone(nn.Module):
         # Per-layer readout energies (CHANGE 3).  These are NOT scaled by
         # the interaction scale — they are absolute energy contributions from
         # the readout MLPs attached to each interaction layer.  Add them to
-        # the MoE-derived interaction energy before the atomic baseline.
+        # the artisan bank-derived interaction energy before the atomic baseline.
         if layer_energies is not None:
             scaled_residual = scaled_residual + layer_energies.to(scaled_residual.dtype)
 
