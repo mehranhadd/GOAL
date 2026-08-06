@@ -18,10 +18,10 @@ import typing
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 from e3nn.o3 import Irreps
 
 from goal.ml.data.graph import AtomicGraph, NodeFeatures
-from goal.ml.registry import BACKBONE_REGISTRY
 
 
 def _require_mace() -> None:
@@ -36,11 +36,16 @@ def _require_mace() -> None:
         ) from None
 
 
-class MACEAdapter:
+class MACEAdapter(nn.Module):
     """Wraps a pre-trained MACE foundation model as a GOAL backbone.
 
-    Satisfies the ``EquivariantBackbone`` protocol without inheriting
-    from any base class.
+    Satisfies the ``EquivariantBackbone`` / ``FeatureExtractorBackbone``
+    protocols.  As an ``nn.Module`` it registers ``self._model`` as a
+    submodule, so the MACE parameters appear in the owning ``GOALModule``'s
+    ``state_dict`` / ``parameters()`` / device placement.  For *fine-tuning*
+    MACE as a monolithic energy/force backbone, prefer
+    :class:`goal.ml.nn.models.foundation.mace.MACEFinetune`; this adapter is
+    for feature extraction and inference.
 
     Parameters
     ----------
@@ -51,9 +56,14 @@ class MACEAdapter:
     """
 
     def __init__(self, mace_model: typing.Any, dtype: torch.dtype = torch.float64) -> None:
+        super().__init__()
         _require_mace()
         self._model: typing.Any = mace_model
         self.dtype: torch.dtype = dtype
+        z_buf = getattr(mace_model, "atomic_numbers", None)
+        self._z_list: tuple[int, ...] | None = (
+            tuple(int(z) for z in z_buf.tolist()) if z_buf is not None else None
+        )
 
     @classmethod
     def from_pretrained(cls, variant: str = "large") -> MACEAdapter:
@@ -91,7 +101,6 @@ class MACEAdapter:
         model: typing.Any = torch.load(str(path), map_location="cpu", weights_only=False, **kwargs)
         # Handle case where checkpoint is a state_dict rather than full model
         if isinstance(model, dict) and "model" in model:
-            from mace.tools.scripts_utils import get_default_args
 
             # NOTE: Full model reconstruction from state_dict requires
             # MACE model config. This path is best-effort.
@@ -125,37 +134,25 @@ class MACEAdapter:
         )
 
     def _to_mace_batch(self, graph: AtomicGraph) -> dict[str, typing.Any]:
-        """Convert GOAL AtomicGraph to MACE's expected input format."""
-        unit_shifts = graph.unit_shifts
-        if unit_shifts is None:
-            unit_shifts = torch.zeros(
-                graph.edge_index.shape[1],
-                3,
-                dtype=torch.long,
-                device=graph.positions.device,
+        """Convert GOAL ``AtomicGraph`` to MACE's expected input dict.
+
+        Delegates to :func:`goal.ml.nn.models.foundation.mace.atomicgraph_to_mace_batch`,
+        which follows ``mace.data.AtomicData`` exactly (one-hot ``node_attrs``
+        over the model z-table, Cartesian ``shifts = unit_shifts @ cell``).
+        """
+        from goal.ml.nn.models.foundation.mace import atomicgraph_to_mace_batch
+
+        z_list = self._z_list
+        if z_list is None:
+            raise ValueError(
+                "MACEAdapter cannot build node_attrs: the model exposes no "
+                "`atomic_numbers` z-table."
             )
-        return {
-            "positions": graph.positions,
-            "node_attrs": graph.atomic_numbers,
-            "edge_index": graph.edge_index,
-            "shifts": graph.edge_vectors,
-            "unit_shifts": unit_shifts,
-            "cell": graph.cell,
-            "batch": graph.batch,
-            "ptr": graph.ptr,
-        }
+        return atomicgraph_to_mace_batch(graph, z_list, self.dtype)
 
-    def parameters(self) -> typing.Iterator[torch.nn.Parameter]:
-        """Proxy to underlying model parameters (for freezing)."""
-        return self._model.parameters()
-
-    def named_parameters(
-        self,
-        prefix: str = "",
-        recurse: bool = True,
-    ) -> typing.Iterator[tuple[str, torch.nn.Parameter]]:
-        """Proxy to underlying model named_parameters."""
-        return self._model.named_parameters(prefix=prefix, recurse=recurse)
+    # NOTE: parameters()/named_parameters() are inherited from nn.Module now;
+    # ``self._model`` is a registered submodule, so they include the MACE
+    # weights (prefixed ``_model.``) automatically — no manual proxy needed.
 
     def requires(self) -> list[str]:
         """Required pip packages for this adapter."""

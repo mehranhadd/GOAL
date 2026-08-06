@@ -11,7 +11,9 @@ Supports:
 
 from __future__ import annotations
 
+import sys
 import typing
+import warnings
 from pathlib import Path
 
 import lightning as L
@@ -85,6 +87,60 @@ def _discover_files_in_dir(
     return files
 
 
+# Fragment-label options.  Understood by every ``BaseAtomicDataset``, but
+# not by the benchmark loaders in ``examples.datasets`` (md17 / qm9 / ani1),
+# which are a separate hierarchy.
+_FRAGMENT_KEYS: tuple[str, ...] = (
+    "compute_fragment_index",
+    "fragment_covalent_cutoff",
+    "fragment_scheme",
+    "fragment_charge",
+    "fragment_on_failure",
+    "fragment_smarts",
+    "fragment_keep_groups",
+)
+
+
+def _resolve_fragment_keys(
+    ds_cls: type,
+    extra: dict[str, typing.Any],
+) -> dict[str, typing.Any]:
+    """Drop the fragment-label options for datasets that cannot use them.
+
+    ``data.compute_fragment_index`` / ``data.fragment_covalent_cutoff`` are
+    forwarded to the dataset like every other non-meta ``data`` key, so a
+    dataset class that predates them (the ``examples.datasets`` benchmark
+    loaders) would raise an opaque ``TypeError: unexpected keyword
+    argument``.  Silently dropping them is right when the feature is *off*
+    — the keys then say nothing about intent — but wrong when it is on,
+    because the run would train with the fragment channel enabled and no labels to
+    feed it.  So: drop when disabled, raise a pointed error when enabled.
+    """
+    present: list[str] = [k for k in _FRAGMENT_KEYS if k in extra]
+    if not present:
+        return extra
+
+    import inspect
+
+    params = inspect.signature(ds_cls.__init__).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return extra
+    unsupported: list[str] = [k for k in present if k not in params]
+    if not unsupported:
+        return extra
+
+    if bool(extra.get("compute_fragment_index", False)):
+        raise ValueError(
+            f"data.compute_fragment_index is enabled but dataset "
+            f"{ds_cls.__name__} does not support fragment labels.  Fragment "
+            f"cross-attention (model.backbone.fragment_ca) needs them, so "
+            f"either switch to a dataset that provides them (xyz, trajectory, "
+            f"lmdb, hdf5) or set data.compute_fragment_index: false and remove "
+            f"the model.backbone.fragment_ca section."
+        )
+    return {k: v for k, v in extra.items() if k not in unsupported}
+
+
 def _build_datasets(
     ds_cls: type,
     paths: list[str],
@@ -93,6 +149,7 @@ def _build_datasets(
     extra: dict[str, typing.Any],
 ) -> list[BaseAtomicDataset]:
     """Instantiate one dataset per path."""
+    extra = _resolve_fragment_keys(ds_cls, extra)
     datasets: list[BaseAtomicDataset] = []
     for p in paths:
         root: Path = Path(p)
@@ -180,6 +237,7 @@ class GOALDataModule(L.LightningDataModule):
         "merge_strategy",
         "split_ratio",
         "split_seed",
+        "multiprocessing_context",
     }
 
     def _extra_kwargs(self) -> dict[str, typing.Any]:
@@ -211,13 +269,13 @@ class GOALDataModule(L.LightningDataModule):
         has_per_split: bool = "train_paths" in data_cfg and data_cfg.train_paths is not None
 
         if has_dir:
-            rank_zero_info(f"[DataModule] Mode 4 — directory-based per-split loading")
+            rank_zero_info("[DataModule] Mode 4 — directory-based per-split loading")
             self._setup_from_dirs(ds_cls, data_cfg, cutoff, extra, merge, seed, stage)
         elif has_per_split:
-            rank_zero_info(f"[DataModule] Mode 2 — per-split path loading")
+            rank_zero_info("[DataModule] Mode 2 — per-split path loading")
             self._setup_per_split(ds_cls, data_cfg, cutoff, extra, merge, seed, stage)
         else:
-            rank_zero_info(f"[DataModule] Mode 1/3 — auto-split from root")
+            rank_zero_info("[DataModule] Mode 1/3 — auto-split from root")
             self._setup_auto_split(ds_cls, data_cfg, cutoff, extra, merge, seed, stage)
 
         # Report dataset sizes after setup
@@ -317,12 +375,29 @@ class GOALDataModule(L.LightningDataModule):
         seed,
         stage,
     ) -> None:
-        """Mode 1 / 3: load from root (single or list), then split."""
+        """Mode 1 / 3: load from root (single or list), then split.
+
+        A **single file** root (the common ``root: /path/to/file.traj`` case)
+        has no sibling ``{split}.<ext>`` files to discover — the datasets
+        would each fall back to loading the *whole* file, so every split would
+        be identical (train == val == test, full data leakage) and
+        ``split_ratio`` would be silently ignored.  We therefore route file
+        roots straight to the numeric split.  Named per-split files only make
+        sense inside a **directory** root, so ``_try_named_splits`` is
+        attempted only then, falling back to a numeric split over the
+        directory's contents if no ``{split}.<ext>`` files exist.
+        """
         roots = _resolve_paths(data_cfg.root)
         split_ratio = data_cfg.get("split_ratio", [0.8, 0.1, 0.1])
 
-        # Try per-split files first (e.g. train.xyz, val.xyz exist)
-        # If that fails, load the whole thing and split numerically
+        all_files: bool = all(Path(r).is_file() for r in roots)
+        if all_files:
+            # Single file (or explicit list of files) → load once, split by ratio.
+            self._numeric_split(ds_cls, roots, cutoff, extra, merge, seed, split_ratio, stage)
+            return
+
+        # Directory root(s): prefer real {split}.<ext> files; if none exist the
+        # datasets raise FileNotFoundError and we numeric-split the directory.
         try:
             self._try_named_splits(ds_cls, roots, cutoff, extra, merge, seed, stage)
         except FileNotFoundError:
@@ -364,8 +439,25 @@ class GOALDataModule(L.LightningDataModule):
         split_ratio,
         stage,
     ) -> None:
-        """Load all data at once and split by ratio."""
-        all_datasets = _build_datasets(ds_cls, roots, "train", cutoff, extra)
+        """Load all data at once and split by ratio.
+
+        Directory roots are expanded into their contained data files so a
+        single dataset can be built and split.  Split lengths always sum to
+        the total (no frames lost); the remainder after flooring val/test is
+        assigned to *train*, so a tiny dataset (e.g. 1 frame) puts everything
+        in train rather than starving it.  A positive ratio that rounds to 0
+        frames emits a warning instead of failing silently.
+        """
+        # Expand any directory roots into their contained data files.
+        expanded: list[str] = []
+        for r in roots:
+            p = Path(r)
+            if p.is_dir():
+                expanded.extend(_discover_files_in_dir(p))
+            else:
+                expanded.append(str(r))
+
+        all_datasets = _build_datasets(ds_cls, expanded, "train", cutoff, extra)
         full = _merge_datasets(all_datasets, merge, seed)
         total = len(full)
 
@@ -375,16 +467,31 @@ class GOALDataModule(L.LightningDataModule):
         else:
             ratios = [float(split_ratio), 1.0 - float(split_ratio)]
 
-        # Compute lengths
+        # Compute lengths.  Floor val/test, give the remainder to train so
+        # train is never starved and small datasets don't lose their frames.
         if len(ratios) == 2:
-            n_train = int(total * ratios[0])
-            n_val = total - n_train
+            n_val = min(int(total * ratios[1]), total)
+            n_train = total - n_val
             lengths = [n_train, n_val]
+            names = ("val",)
+            sizes = (n_val,)
         else:
-            n_train = int(total * ratios[0])
             n_val = int(total * ratios[1])
-            n_test = total - n_train - n_val
+            n_test = int(total * ratios[2])
+            n_train = total - n_val - n_test
             lengths = [n_train, n_val, n_test]
+            names = ("val", "test")
+            sizes = (n_val, n_test)
+
+        # Warn if a requested (positive-ratio) split rounded down to 0 frames.
+        for name, size, ratio in zip(names, sizes, ratios[1:]):
+            if ratio > 0.0 and size == 0:
+                warnings.warn(
+                    f"split_ratio requests a '{name}' split but only {total} "
+                    f"frame(s) are available, so it rounded to 0. Provide more "
+                    f"data or explicit per-split files/paths.",
+                    stacklevel=2,
+                )
 
         gen = torch.Generator().manual_seed(seed)
         splits = random_split(full, lengths, generator=gen)
@@ -414,6 +521,16 @@ class GOALDataModule(L.LightningDataModule):
             pf = data_cfg.get("prefetch_factor")
             if pf is not None:
                 kwargs["prefetch_factor"] = pf
+            # Python 3.14 changed the default multiprocessing start method on
+            # Linux to 'forkserver', which trips torch DataLoader workers with
+            # "ValueError: too many fds". Use a 'fork' context (the historical
+            # default, safe for CPU-only data loading) unless the user overrides
+            # via data.multiprocessing_context. Skipped on Windows (no fork).
+            mp_ctx: str | None = data_cfg.get("multiprocessing_context", None)
+            if mp_ctx is None and sys.platform != "win32":
+                mp_ctx = "fork"
+            if mp_ctx is not None:
+                kwargs["multiprocessing_context"] = mp_ctx
         return kwargs
 
     def train_dataloader(self) -> DataLoader:

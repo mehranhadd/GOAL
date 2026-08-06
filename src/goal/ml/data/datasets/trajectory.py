@@ -33,12 +33,23 @@ class TrajectoryDataset(BaseAtomicDataset):
         Cutoff radius for neighbour list construction (Angstrom).
     split : str
         Which split to load — looks for ``{split}.traj`` inside *root*.
-    energy_key : str
-        ASE ``atoms.info`` key for total energy.
-        Falls back to ``atoms.get_potential_energy()`` if not in info.
-    forces_key : str
-        ASE ``atoms.arrays`` key for forces.
-        Falls back to ``atoms.get_forces()`` if not in arrays.
+    energy_key, forces_key, stress_key : str or None
+        Keys for total energy (``atoms.info``), forces (``atoms.arrays``), and
+        stress (``atoms.info``).  ``None`` uses the defaults (``energy`` /
+        ``forces`` / ``stress``).  Each falls back to the ASE calculator
+        (``get_potential_energy`` / ``get_forces`` / ``get_stress``).
+    key_mapping : dict or None
+        MACE/FairChem-style mapping of canonical property → file key, e.g.
+        ``{"energy": "REF_energy", "forces": "REF_forces"}``.  Overrides the
+        per-key arguments.  A configured key that is absent from the file (and
+        not provided by a calculator) raises a clear error listing the keys
+        that *are* present.
+    compute_fragment_index : bool
+        Attach connected-component ``fragment_index`` labels to every
+        frame (needed by the fragment-interaction module).  Computed once
+        at load time, never in the training loop.
+    fragment_covalent_cutoff : float
+        Bond threshold for the fragment decomposition (Angstrom).
     """
 
     def __init__(
@@ -46,10 +57,19 @@ class TrajectoryDataset(BaseAtomicDataset):
         root: str | Path,
         cutoff: float,
         split: str = "train",
-        energy_key: str = "energy",
-        forces_key: str = "forces",
+        energy_key: str | None = None,
+        forces_key: str | None = None,
+        stress_key: str | None = None,
+        key_mapping: typing.Mapping[str, str] | None = None,
         dtype: torch.dtype = torch.float64,
         neighbor_list_backend: str = "ase",
+        compute_fragment_index: bool = False,
+        fragment_covalent_cutoff: float = 1.8,
+        fragment_scheme: str = "connected",
+        fragment_charge: int = 0,
+        fragment_on_failure: str = "fallback",
+        fragment_smarts: typing.Sequence[str] | None = None,
+        fragment_keep_groups: typing.Sequence[str] | None = None,
     ) -> None:
         super().__init__(
             root=root,
@@ -57,9 +77,19 @@ class TrajectoryDataset(BaseAtomicDataset):
             split=split,
             dtype=dtype,
             neighbor_list_backend=neighbor_list_backend,
+            compute_fragment_index=compute_fragment_index,
+            fragment_covalent_cutoff=fragment_covalent_cutoff,
+            fragment_scheme=fragment_scheme,
+            fragment_charge=fragment_charge,
+            fragment_on_failure=fragment_on_failure,
+            fragment_smarts=fragment_smarts,
+            fragment_keep_groups=fragment_keep_groups,
         )
-        self.energy_key: str = energy_key
-        self.forces_key: str = forces_key
+        from goal.ml.data.keys import resolve_label_keys
+
+        self._key_map, self._explicit_keys = resolve_label_keys(
+            energy_key, forces_key, stress_key, key_mapping
+        )
         self._graphs: list[AtomicGraph] = []
         self._load()
 
@@ -72,42 +102,41 @@ class TrajectoryDataset(BaseAtomicDataset):
             path = self.root
         if not path.exists():
             raise FileNotFoundError(f"Dataset file not found: {path}")
+        if path.is_dir():
+            # A directory has no '{split}.traj' inside and is not itself a
+            # readable trajectory. Raise FileNotFoundError (not a cryptic ASE
+            # error) so the datamodule can fall back to numeric splitting over
+            # the directory's contents.
+            raise FileNotFoundError(
+                f"No '{self.split}.traj' found in directory {self.root}, and a "
+                f"directory cannot be read as a trajectory. Point 'root' at a "
+                f"single .traj file, provide per-split files "
+                f"('{self.split}.traj'), or use train_dir/val_dir."
+            )
+
+        from goal.ml.data.keys import extract_ase_labels
 
         traj: typing.Any = Trajectory(str(path), mode="r")
 
         for atoms in traj:
-            # Extract energy
-            energy: typing.Any = atoms.info.get(self.energy_key)
-            if energy is None:
-                try:
-                    energy = atoms.get_potential_energy()
-                except Exception:
-                    energy = None
-
-            # Extract forces
-            forces: typing.Any = atoms.arrays.get(self.forces_key)
-            if forces is None:
-                try:
-                    forces = atoms.get_forces()
-                except Exception:
-                    forces = None
-
-            # Extract stress
-            stress: typing.Any = atoms.info.get("stress")
-            if stress is None:
-                try:
-                    stress = atoms.get_stress(voigt=False)
-                except Exception:
-                    stress = None
-
+            labels: dict[str, typing.Any] = extract_ase_labels(
+                atoms, self._key_map, self._explicit_keys
+            )
             graph: AtomicGraph = AtomicGraph.from_ase(
                 atoms,
                 cutoff=self.cutoff,
-                energy=energy,
-                forces=forces,
-                stress=stress,
+                energy=labels["energy"],
+                forces=labels["forces"],
+                stress=labels["stress"],
                 dtype=self.dtype,
                 neighbor_list_backend=self.neighbor_list_backend,
+                compute_fragment_index=self.compute_fragment_index,
+                fragment_covalent_cutoff=self.fragment_covalent_cutoff,
+                fragment_scheme=self.fragment_scheme,
+                fragment_charge=self.fragment_charge,
+                fragment_on_failure=self.fragment_on_failure,
+                fragment_smarts=self.fragment_smarts,
+                fragment_keep_groups=self.fragment_keep_groups,
             )
             self._graphs.append(graph)
 

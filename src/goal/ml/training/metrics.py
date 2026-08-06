@@ -11,6 +11,14 @@ The entry point is :func:`mlip_metrics(predictions, batch)` which
 returns a flat ``{name: scalar tensor}`` dict.  The training loop
 prefixes the keys with ``"train/"`` or ``"val/"`` and feeds them to
 Lightning's ``log_dict``.
+
+Metrics emitted
+---------------
+``energy_mae_per_atom``, ``energy_rmse_per_atom``, ``forces_mae``,
+``forces_rmse``, ``forces_cosine_similarity``, ``forces_magnitude_mae``,
+and the Newton violation as **four** numbers:
+``newton_violation_{x,y,z}`` per Cartesian axis plus ``newton_violation``
+for their sum.
 """
 
 from __future__ import annotations
@@ -21,7 +29,9 @@ import torch
 
 # Names elevated to the Lightning progress bar.  The training loop
 # reads this so it can route only the headline metrics through
-# ``prog_bar=True``.
+# ``prog_bar=True``.  The per-axis Newton components are deliberately
+# absent: the total carries the headline, and the components are there
+# for the loggers when it goes bad.
 PROG_BAR_METRICS: frozenset[str] = frozenset(
     {
         "energy_mae_per_atom",
@@ -117,16 +127,38 @@ def mlip_metrics(
 
     # ---------- Newton violation (translational-invariance check) ----------
     #
-    # ``v_m = ||Σ_i F_pred_i||`` for each molecule m, averaged over
-    # the batch.  ~0 for autograd-derived forces because the energy
-    # is translation invariant by construction; meaningfully > 0 for
-    # direct heads, in which case it's a real diagnostic of how
-    # badly translation invariance is broken.  Logged regardless of
-    # whether a newton loss is configured — it's a diagnostic, not
-    # a training signal.
+    # The net force on an isolated molecule must vanish:
+    # ``Σ_i F_i = 0``.  Reported **per Cartesian component** plus a
+    # total, four numbers in all:
+    #
+    #   newton_violation_x = mean_m |Σ_i F_i,x|      (same for y, z)
+    #   newton_violation   = _x + _y + _z            (exact sum)
+    #
+    # Splitting by axis is what makes the metric actionable: a single
+    # number tells you translation invariance is broken, whereas three
+    # tell you *where*.  An anisotropic pattern (e.g. z far worse than
+    # x and y) points at a direction-dependent cause — a slab/surface
+    # normal, a cell vector, a mis-set PBC flag, a direct force head
+    # whose projection is unbalanced along one axis — while three
+    # comparable values point at an isotropic cause such as an
+    # unconverged direct head or plain numerical noise.
+    #
+    # Note the total is the **L1** sum of the components, not the
+    # Euclidean norm ‖Σ F‖₂ this metric reported before the split, so
+    # that the four logged numbers are exactly consistent
+    # (total = x + y + z).  The two differ by at most √3, so absolute
+    # scale and any threshold you had in mind are unaffected.
+    #
+    # ~0 for autograd-derived forces (the energy is translation
+    # invariant by construction); meaningfully > 0 for direct heads.
+    # Logged whether or not a newton loss is configured — it is a
+    # diagnostic, not a training signal.
     batch_idx: typing.Any = getattr(batch, "batch", None)
     if pred_f is not None and batch_idx is not None:
         net_force_per_graph: torch.Tensor = _scatter_sum_batch(pred_f, batch_idx)  # (G, 3)
-        out["newton_violation"] = net_force_per_graph.norm(dim=-1).mean()
+        per_component: torch.Tensor = net_force_per_graph.abs().mean(dim=0)  # (3,)
+        for axis_idx, axis in enumerate(("x", "y", "z")):
+            out[f"newton_violation_{axis}"] = per_component[axis_idx]
+        out["newton_violation"] = per_component.sum()
 
     return out

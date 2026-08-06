@@ -41,7 +41,7 @@ A modular, open-source framework for building, training, and deploying machine-l
 |:---|:---|:---|:---|
 | [Overview](#-overview) | [Training](#-training) | [Models & Heads](#-models) | [Configuration System](#-configuration-system) |
 | [Installation](#-installation) | [Evaluation](#-evaluation) | [Loss Functions](#-loss-functions) | [Logging](#-logging) |
-| [Project Structure](#-project-structure) | [ASE Calculator](#-ase-calculator) | [Foundation Model Adapters](#-foundation-model-adapters) | [Callbacks](#-callbacks) |
+| [Project Structure](#-project-structure) | [ASE Calculator](#-ase-calculator) · [QM Calculators](#-qm-calculators) | [Foundation Model Adapters](#-foundation-model-adapters) | [Callbacks](#-callbacks) |
 | [Quick Start](#-quick-start) | [Fine-Tuning](#-fine-tuning) | [Feature Extraction](#-feature-extraction) | [CLI Reference](#-cli-reference) |
 | [**Tutorial Notebook**](notebooks/getting_started.ipynb) | [Data Loading](#-data-loading) | [Performance Engineering](#-performance-engineering) | [Pixi Tasks](#-pixi-tasks) |
 | | [Benchmark Datasets](#-benchmark-datasets) | [Hyperparameter Tuning](#-hyperparameter-tuning) | |
@@ -58,10 +58,11 @@ A modular, open-source framework for building, training, and deploying machine-l
 
 | | Feature | Details |
 |---|---|---|
-| 🔬 | **Equivariant & invariant backbones** | HyperSpec (E(3)-equivariant) and SchNet-like invariant GNN |
-| 🧱 | **Modular & monolithic models** | Backbone→head pipeline (HyperSpec, InvariantGNN, DeepSet, HyperSet, LucidSet) or self-contained monolithic models for external architectures |
+| 🔬 | **Native SIMURGH force field** | E(3)-equivariant potential-artisan models — **ARACE** (artisan + ACE alternating, the default) and the legacy ACE-first variant |
+| 🧱 | **Modular & monolithic models** | Backbone→head pipeline (SIMURGH ARACE, HyperSpec, InvariantGNN) or self-contained monolithic models for external architectures |
 | 🎯 | **Multiple task heads** | Energy, forces, stress, dipole, direct forces, generic scalar, **multi-head** |
-| 🧠 | **Foundation model adapters** | MACE and FairChem (UMA) pre-trained models |
+| 🧠 | **Foundation-model fine-tuning** | Fine-tune MACE & UMA in-process (`head_only` / `full` / LoRA) through GOALModule; feature-extraction adapters too |
+| ⚗️ | **QM & pretrained calculators** | ORCA, CP2K, Quantum ESPRESSO, VASP, UPET/PET-MAD, xTB, MACE, FlashMD via `CalculatorFactory` |
 | 📂 | **Flexible data loading** | XYZ, HDF5, LMDB, ASE trajectory; multi-file merge, directory-based loading, auto-splitting |
 | ⚡ | **Distributed training** | DDP, FSDP, FSDP2 (ModelParallel), DeepSpeed ZeRO (Stages 1/2/3 + CPU offload) |
 | 🧮 | **Configurable loss** | Per-property loss type (MSE, MAE, Huber, Smooth L1) + composite sub-losses |
@@ -98,11 +99,19 @@ pip install -e .
 Optional extras:
 
 ```bash
-pip install -e ".[mace]"       # MACE adapter
 pip install -e ".[fairchem]"   # FairChem/UMA adapter
 pip install -e ".[deepspeed]"  # DeepSpeed ZeRO strategies
 pip install -e ".[all]"        # All optional dependencies
 pip install -e ".[dev]"        # pytest, ruff, mypy
+```
+
+Fine-tuning & calculator dependencies (installed separately):
+
+```bash
+pip install "mace-torch>=0.3.16"  # MACE fine-tuning backbone (standalone venv — see note)
+pip install fairchem-core         # UMA fine-tuning backbone
+pip install peft                  # LoRA fine-tuning strategy
+pip install upet                  # UPET / PET-MAD calculator (MD inference + fine-tune target)
 ```
 
 ### With pixi (recommended)
@@ -143,7 +152,7 @@ pixi install -e cuda-deepspeed  # CUDA + DeepSpeed
 ```
 
 > **Note:** Some optional dependencies have compatibility constraints:
-> - **MACE adapter** — pins `e3nn==0.4.4` which conflicts with the core `e3nn>=0.5` requirement. Install via `pip install -e ".[mace]"` instead.
+> - **MACE** — `mace-torch` pins `e3nn==0.4.4`, which conflicts with the core `e3nn>=0.5`. Install it in a **standalone virtualenv** (not the pixi/core env); see [`docs/finetuning/mace.md`](docs/finetuning/mace.md).
 > - **Ray Tune / Optuna** — no Python 3.14 wheels yet. Install via `pip install -e ".[tune]"` on Python ≤3.13.
 
 ---
@@ -156,32 +165,32 @@ pixi install -e cuda-deepspeed  # CUDA + DeepSpeed
 <summary>📁 <b>Click to expand full project tree</b></summary>
 
 ```
-├── configs/                        # Hydra configuration groups
-│   ├── train.yaml                  #   Training defaults composition
-│   ├── eval.yaml                   #   Evaluation defaults composition
-│   ├── callbacks/                  #   Callback configs (checkpoint, EMA, SWA, …)
-│   ├── data/                       #   Dataset configs (xyz, hdf5, lmdb, trajectory, benchmarks)
-│   ├── hparams_search/             #   Hyperparameter search (basic, ray_tune, wandb_sweep)
-│   ├── logger/                     #   Logger configs (wandb, tensorboard, csv, …)
-│   ├── model/                      #   Model configs (hyperspec, invariant_gnn)
-│   ├── strategy/                   #   Strategy configs (ddp, fsdp, fsdp2, deepspeed_*)
-│   ├── trainer/                    #   Trainer configs (gpu, ddp, fsdp, model_parallel, …)
-│   ├── training/                   #   Training hyperparameters (optimizer, EMA, losses, …)
-│   ├── paths/                      #   Path definitions
-│   └── hydra/                      #   Hydra runtime settings
+├── configs/                        # Hydra configuration
+│   ├── ml/                         #   Self-contained ML experiment configs
+│   │   ├── simurgh_gmd26.yaml      #     DEFAULT — SIMURGH ARACE on GMD-26
+│   │   ├── simurgh_gmd26_hpo.yaml  #     ARACE hyperparameter search (Ray Tune)
+│   │   ├── simurgh_ace_first_gmd26.yaml  # legacy ACE-first SIMURGH
+│   │   ├── monolithic_arace_gmd26.yaml   # monolithic ARACE (ablation)
+│   │   ├── simurgh_md17.yaml       #     legacy SIMURGH on MD17
+│   │   └── hyperspec_md17.yaml     #     HyperSpec baseline on MD17
+│   ├── md/                         #   MD simulation configs (calculators, dynamics, MTS)
+│   ├── hparams_search/             #   Hyperparameter search schemas (basic, ray_tune, wandb_sweep)
+│   ├── debug/                      #   Debug presets (overfit, profiler, limit, fdr)
+│   ├── extras/, hydra/, paths/     #   Runtime settings
 ├── src/
 │   └── goal/                       # Top-level namespace package
 │       └── ml/                     #   ML training module
-│           ├── cli/                #     Entry points: train, evaluate, finetune, tune
+│           ├── cli/                #     Entry points: train, evaluate, finetune, tune, pack, inspect
 │           ├── data/               #     DataModule, datasets (xyz, hdf5, lmdb, trajectory, concat)
 │           ├── nn/                 #     Neural network components
-│           │   ├── models/         #       Backbones: HyperSpec, InvariantGNN, DeepSet, HyperSet, LucidSet; MonolithicExample
+│           │   ├── models/         #       Backbones: SIMURGH (ARACE + legacy), HyperSpec, InvariantGNN; monolithic models
+│           │   │   └── simurgh/    #         backbone_arace (default), backbone (legacy), monolithic, arace
 │           │   ├── heads/          #       Task heads: energy, forces, stress, dipole, scalar, multi
-│           │   ├── blocks/         #       Building blocks: embedding, interaction, readout
+│           │   ├── blocks/         #       Building blocks: artisans, ace_block, env_dressing, interaction, embedding, readout
 │           │   └── primitives/     #       Low-level ops: tensor products, radial basis, norms
 │           ├── adapters/           #     Foundation model wrappers: MACE, FairChem
 │           ├── training/           #     LightningModule, loss, EMA, tuning
-│           │   ├── callbacks/      #       Checkpoint, logging callbacks
+│           │   ├── callbacks/      #       Checkpoint manager, logging, progress callbacks
 │           │   └── strategies/     #       Strategy factory: DDP, FSDP, FSDP2, DeepSpeed
 │           ├── utils/              #     ASE calculator, feature extraction, mini trainer
 │           └── registry.py         #     Lazy component registry
@@ -203,19 +212,25 @@ pixi install -e cuda-deepspeed  # CUDA + DeepSpeed
 ## 🔵 Quick Start
 <!-- ═══════════════════════════════════════════════════════════════════ -->
 
-Train the default model (HyperSpec) on XYZ data:
+Train the default model — **SIMURGH ARACE** — with the default experiment config:
 
 ```bash
-goal-train data.root=/path/to/dataset
+goal-train                        # loads configs/ml/simurgh_gmd26.yaml
 ```
 
 Or equivalently via module:
 
 ```bash
-python -m goal.ml.cli.train data.root=/path/to/dataset
+python -m goal.ml.cli.train
 ```
 
-This loads `configs/train.yaml` which composes: `data=xyz`, `model=hyperspec`, `training=default`, `trainer=default`.
+Experiment configs live in `configs/ml/` as **self-contained files** — one file describes the whole run (data, model, trainer, losses, checkpointing, logging). Pick one with `--config-name` and override any field from the CLI:
+
+```bash
+goal-train --config-name simurgh_md17            # legacy SIMURGH on MD17
+goal-train --config-name monolithic_arace_gmd26  # monolithic ARACE (ablation)
+goal-train data.train_dir=/path/to/train trainer.max_epochs=100
+```
 
 > **📓 New to GOAL?** Work through [`notebooks/getting_started.ipynb`](notebooks/getting_started.ipynb) — a step-by-step tutorial covering model building (modular & monolithic), dataset loading, training, and using trained models as ASE calculators.
 
@@ -227,117 +242,71 @@ This loads `configs/train.yaml` which composes: `data=xyz`, `model=hyperspec`, `
 
 ### Single GPU
 
-```bash
-goal-train trainer=gpu data.root=/path/to/dataset
-```
+The default configs already set `accelerator: gpu` and `devices: 1`:
 
-The `gpu` trainer config sets `accelerator: gpu` and `devices: 1`.
+```bash
+goal-train                                    # SIMURGH ARACE, single GPU
+goal-train trainer.accelerator=cpu            # CPU instead
+```
 
 ### Multi-GPU: DDP
 
 Distributed Data Parallel — replicates the full model on each GPU and synchronizes gradients. Use when the model fits in a single GPU's memory.
 
 ```bash
-goal-train trainer=ddp data.root=/path/to/dataset
-```
-
-Override the number of GPUs:
-
-```bash
-goal-train trainer=ddp trainer.devices=8
+goal-train strategy.name=ddp trainer.devices=8
 ```
 
 Multi-node:
 
 ```bash
-goal-train trainer=ddp trainer.devices=4 trainer.num_nodes=2
+goal-train strategy.name=ddp trainer.devices=4 trainer.num_nodes=2
 ```
 
-DDP key settings (in `configs/trainer/ddp.yaml`):
-- `find_unused_parameters: false` — set `true` if you have frozen layers
+DDP key settings (in the `strategy:` section of every `configs/ml/*.yaml`):
+
+- `find_unused_parameters: false` — set `true` if you have frozen layers.
+  Not needed for SIMURGH/ARACE: the artisan bank uses a static-shape
+  zero-masking schedule so every parameter participates every step.
 - `static_graph: false` — set `true` for models with fixed computation graphs (faster)
 - `gradient_as_bucket_view: true` — minor memory optimisation
-- `sync_batchnorm: true` — synchronize batch norm statistics across GPUs
 
 ### Multi-GPU: FSDP
 
 Fully Sharded Data Parallel — shards model parameters, gradients, and optimizer states across GPUs. Use when the model doesn't fit in a single GPU's memory.
 
 ```bash
-goal-train trainer=fsdp data.root=/path/to/dataset
+goal-train strategy.name=fsdp trainer.precision=bf16-mixed
 ```
 
-FSDP settings (in `configs/trainer/fsdp.yaml`):
+FSDP settings (in the `strategy:` section):
+
 - `auto_wrap_policy` — controls how modules are wrapped for sharding
-- `activation_checkpointing_policy` — trade compute for memory by recomputing activations
+- `activation_checkpointing` — trade compute for memory by recomputing activations
 - `cpu_offload: false` — offload parameters to CPU (slower, saves GPU memory)
-- `precision: "bf16-mixed"` — recommended for FSDP on Ampere+ GPUs
 
 ### Multi-GPU: FSDP2 / ModelParallel
 
 ModelParallelStrategy (Lightning 2.4+) — supports FSDP2, tensor parallelism, `torch.compile`, and FP8. Recommended for very large models (500M+ parameters).
 
 ```bash
-goal-train trainer=model_parallel data.root=/path/to/dataset
-```
-
-Or via the strategy factory:
-
-```bash
-goal-train +strategy=fsdp2 data.root=/path/to/dataset
+goal-train strategy.name=fsdp2
 ```
 
 ### Multi-GPU: DeepSpeed
 
 [DeepSpeed](https://www.deepspeed.ai/) ZeRO enables training of very large models by partitioning optimizer states, gradients, and parameters across GPUs. Requires `pip install -e ".[deepspeed]"`.
 
-**ZeRO Stage 1** — optimizer state partitioning only (lowest communication overhead):
 ```bash
-goal-train +strategy=deepspeed_zero1 data.root=/path/to/dataset
+goal-train strategy.name=deepspeed_zero1   # optimizer state partitioning
+goal-train strategy.name=deepspeed_zero2   # + gradient partitioning
+goal-train strategy.name=deepspeed_zero3   # + parameter partitioning
+goal-train strategy.name=deepspeed_zero3_offload   # + CPU offload
 ```
-
-**ZeRO Stage 2** — optimizer state + gradient partitioning:
-```bash
-goal-train +strategy=deepspeed_zero2 data.root=/path/to/dataset
-```
-
-**ZeRO Stage 3** — full parameter partitioning (maximum memory savings):
-```bash
-goal-train +strategy=deepspeed_zero3 data.root=/path/to/dataset
-```
-
-**ZeRO Stage 3 + CPU offload** — offload parameters to CPU (for extremely large models):
-```bash
-goal-train +strategy=deepspeed_zero3_offload data.root=/path/to/dataset
-```
-
-<details>
-<summary>📋 DeepSpeed configuration options</summary>
-
-```yaml
-# configs/strategy/deepspeed_zero3.yaml
-name: deepspeed_zero3
-stage: 3
-allgather_bucket_size: 200_000_000
-reduce_bucket_size: 200_000_000
-logging_level: WARNING
-```
-
-</details>
 
 ### Strategy Factory
 
-GOAL provides a unified **strategy factory** (`build_strategy()`) that maps config to Lightning strategies. When `cfg.strategy` is present, it takes priority over the trainer's built-in strategy.
-
-```yaml
-# Two ways to select a strategy:
-# 1. Via trainer config group (backward compatible):
-goal-train trainer=ddp
-
-# 2. Via strategy config group (new, more options):
-goal-train +strategy=fsdp2
-goal-train +strategy=deepspeed_zero3_offload
-```
+GOAL provides a unified **strategy factory** (`build_strategy()`) that maps the `strategy:` config section to Lightning strategies. When `cfg.strategy` is present, it takes priority over the trainer's built-in strategy. All strategy parameters (bucket sizes, wrap policies, ZeRO stage, …) live in the `strategy:` section of the self-contained experiment configs.
 
 | Strategy Config | Lightning Strategy | Use Case |
 |---|---|---|
@@ -352,37 +321,28 @@ goal-train +strategy=deepspeed_zero3_offload
 ### Apple Silicon (MPS)
 
 ```bash
-goal-train trainer=mps data.root=/path/to/dataset
+goal-train trainer.accelerator=mps
 ```
 
 ### CPU
 
 ```bash
-goal-train trainer=cpu data.root=/path/to/dataset
+goal-train trainer.accelerator=cpu
 ```
 
 ### Resuming Training
 
-If training is interrupted (crash, preemption, timeout), GOAL **automatically resumes** from the latest checkpoint.  `auto_resume` is enabled by default — on every launch the framework scans previous run directories for the most recent `last.ckpt` that matches the current dataset + model combination:
+If training is interrupted (crash, preemption, timeout), GOAL **automatically resumes**: on launch, `goal-train` looks for `last.ckpt` in the run's `training.checkpoint_dir` and, if present, restores the full training state (model weights, optimiser, scheduler, epoch counter — logging continues from the restored epoch). The `GOALCheckpointManager` pool state is restored alongside from `checkpoint_state.json`, and a `TRAINING_COMPLETE` sentinel prevents SLURM requeue loops after a successful finish.
 
-```
-logs/train/runs/
-  2026-04-08_10-30-00_xyz_deepset/checkpoints/last.ckpt  ← found & resumed
-  2026-04-07_09-00-00_xyz_deepset/checkpoints/last.ckpt  ← older, skipped
-  2026-04-08_11-00-00_xyz_hyperspec/checkpoints/last.ckpt ← different model, ignored
-```
-
-Lightning restores the full training state (model weights, optimiser, scheduler, epoch counter, dataloader position) so training continues exactly where it left off.
-
-**Override behaviour:**
+Because `training.checkpoint_dir` defaults to the current (timestamped) output directory, a fresh launch starts a fresh run. To resume a *previous* run, point both checkpoint keys at its checkpoint folder:
 
 ```bash
-# Disable auto-resume (always start fresh)
-goal-train auto_resume=false
-
-# Resume from a specific checkpoint (takes priority over auto-resume)
-goal-train ckpt_path=/path/to/specific/checkpoint.ckpt
+goal-train \
+  training.checkpoint_dir=logs/simurgh_gmd26/runs/<old_run>/checkpoints \
+  checkpoint_manager.dirpath=logs/simurgh_gmd26/runs/<old_run>/checkpoints
 ```
+
+`training.checkpoint_dir` is where `last.ckpt` and the pool state are found; `checkpoint_manager.dirpath` is where the continued run writes new checkpoints. If the old run finished normally, remove its `TRAINING_COMPLETE` sentinel first — otherwise `goal-train` exits immediately. Note the EMA shadow weights are not stored in checkpoints; the EMA re-initialises from the restored weights and re-converges within a few hundred steps.
 
 ---
 
@@ -415,7 +375,7 @@ Any trained GOAL model can be used as an [ASE Calculator](https://wiki.fysik.dtu
 ```python
 from goal.ml.utils.calculator import GOALCalculator
 
-calc = GOALCalculator(checkpoint_path="logs/train/runs/.../last.ckpt")
+calc = GOALCalculator(checkpoint_path="logs/simurgh_gmd26/runs/.../checkpoints/last.ckpt")
 ```
 
 ### From a Pre-loaded Module
@@ -472,57 +432,55 @@ dyn.run(1000)
 ---
 
 <!-- ═══════════════════════════════════════════════════════════════════ -->
+## 🟢 QM Calculators
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+
+Beyond running trained GOAL models (above), GOAL builds ASE calculators for reference/QM engines and pretrained potentials through `CalculatorFactory` — for MD, single-points, and multi-timescale (MTS) QM/ML learning.
+
+```python
+from goal.md import CalculatorFactory
+
+calc = CalculatorFactory.create("cp2k", preset="molecular", n_mpi=4)
+```
+
+| Key | Engine | Notes |
+|-----|--------|-------|
+| `orca` | ORCA | reference DFT / wavefunction |
+| `cp2k` | CP2K | `set_pos_file=True` by default — fixes stdin stalls on MPI builds (needs CP2K ≥ 2024.2); `molecular`/`bulk` presets |
+| `espresso` | Quantum ESPRESSO | **new** — `pw.x`; SSSP pseudopotentials required |
+| `vasp` | VASP | **new** — commercial; needs `$VASP_PP_PATH` |
+| `upet` | UPET / PET-MAD | pretrained PET (`pet-mad`/`pet-omat`/`pet-oam`/`pet-spice`); `pip install upet` |
+| `xtb`, `mace`, `flashmd`, `nequip` | semi-empirical / pretrained ML | drop-in ASE calculators |
+
+Calculator configs live in `configs/md/calculators/`. See [`docs/calculators/`](docs/calculators/cp2k.md).
+
+---
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
 ## 🟢 Fine-Tuning
 <!-- ═══════════════════════════════════════════════════════════════════ -->
 
-Fine-tune a pre-trained foundation model on a downstream dataset:
+GOAL fine-tunes pre-trained foundation models **in-process**: each becomes a normal GOAL backbone and trains through the same `GOALModule` + PyTorch Lightning trainer as native models — reusing the loss, stage curriculum, `GOALCheckpointManager`, DDP/FSDP, and HPO. No separate training loop.
+
+| Model | Backbone | Entry point |
+|-------|----------|-------------|
+| MACE | `mace_finetune` | `goal-train --config-name finetune/mace` |
+| UMA / FairChem | `uma_finetune` | `goal-train --config-name finetune/uma` |
+| UPET / PET | metatrain subprocess | `goal-finetune-upet` |
+
+MACE and UMA are monolithic backbones (`head: null`) returning `{energy, forces}`. Choose a strategy via `model.backbone.strategy`:
+
+| Strategy | Trains | When |
+|----------|--------|------|
+| `head_only` | final readout layers only (rest frozen) | small datasets; fastest, most stable |
+| `full` | all parameters | larger datasets; use a much smaller LR (~1e-5) |
+| `lora` | frozen base + LoRA adapters on every `nn.Linear` (needs `peft`) | parameter-efficient adaptation |
 
 ```bash
-goal-finetune model.backbone.name=mace-large model.backbone.pretrained=true data.root=/path/to/dataset
+goal-train --config-name finetune/mace model.backbone.strategy=head_only data.root=/path/to/dataset
 ```
 
-### Backbone Loading Modes
-
-**1. Pre-trained hub model:**
-
-```bash
-goal-finetune model.backbone.name=mace-large model.backbone.pretrained=true model.backbone.variant=large
-```
-
-**2. Local checkpoint:**
-
-```bash
-goal-finetune model.backbone.name=mace-large model.backbone.local_checkpoint=/path/to/model.pt
-```
-
-**3. Fresh backbone (train from scratch):**
-
-```bash
-goal-finetune model.backbone.name=mace-large
-```
-
-### Freeze Backbone (Linear Probing)
-
-```bash
-goal-finetune training.freeze_backbone=true model.backbone.name=mace-large model.backbone.pretrained=true
-```
-
-### Gradual Unfreezing
-
-Use the backbone finetuning callback:
-
-```bash
-goal-finetune callbacks=backbone_finetuning model.backbone.name=mace-large model.backbone.pretrained=true
-```
-
-This freezes the backbone initially, then unfreezes at epoch 10 with a reduced learning rate (10% of head LR).
-
-### Available Adapters
-
-| Adapter | Registry Names | Source |
-|---------|---------------|--------|
-| MACE | `mace-large`, `mace-medium`, `mace-small` | `mace-torch` |
-| FairChem/UMA | `uma-small` | `fairchem-core` |
+Per-element reference energies (E0s) are **re-estimated from your training set** before fitting (`reestimate_e0s: true`) — otherwise the mismatch with the foundation model's original E0s is the most common cause of fine-tuning failure. MACE needs `mace-torch` in a standalone venv (e3nn conflict). UPET uses metatensor internally, so it is fine-tuned by a thin CLI that runs `mtt train`; the result loads back as a UPET calculator. See [`docs/finetuning/`](docs/finetuning/overview.md).
 
 ---
 
@@ -671,27 +629,25 @@ data:
 
 Ready-to-use benchmark datasets for training and evaluating MLIPs. **Completely optional** — the core framework works without them.
 
-| Dataset | Structures | Elements | Properties | Size | Config |
-|---------|-----------|----------|------------|------|--------|
-| **MD17** | ~10k/mol | H, C, N, O | energy, forces | ~100 MB | `data=md17_aspirin` |
-| **rMD17** | ~10k/mol | H, C, N, O | energy, forces | ~100 MB | `data=rmd17_aspirin` |
-| **ANI-1** | ~20M | H, C, N, O | energy, forces | ~30 GB | `data=ani1` |
-| **ANI-1x** | ~5M | H, C, N, O | energy, forces | ~7 GB | `data=ani1x` |
-| **QM9** | 134k | H, C, N, O, F | 19 properties | ~1 GB | `data=qm9` |
-| **SPICE** | ~1.1M | 10 elements | energy, forces | ~15 GB | — |
+| Dataset | Structures | Elements | Properties | Size | `data.dataset_type` |
+|---------|-----------|----------|------------|------|------|
+| **MD17** | ~10k/mol | H, C, N, O | energy, forces | ~100 MB | `md17` |
+| **rMD17** | ~10k/mol | H, C, N, O | energy, forces | ~100 MB | `rmd17` |
+| **ANI-1** | ~20M | H, C, N, O | energy, forces | ~30 GB | `ani1` |
+| **ANI-1x** | ~5M | H, C, N, O | energy, forces | ~7 GB | `ani1x` |
+| **QM9** | 134k | H, C, N, O, F | 19 properties | ~1 GB | `qm9` |
+| **SPICE** | ~1.1M | 10 elements | energy, forces | ~15 GB | `spice` |
 
 ```bash
-# Train on MD17 aspirin
-goal-train data=md17_aspirin
+# Train on MD17 aspirin (ready-made experiment config)
+goal-train --config-name simurgh_md17
 
-# Train on ANI-1x, subsample 50k for quick experiment
-goal-train data=ani1x data.max_structures=50000
+# Switch molecule / dataset via overrides
+goal-train --config-name simurgh_md17 data.molecule=ethanol
+goal-train data.dataset_type=ani1x data.max_structures=50000
 
-# Train on QM9 predicting HOMO-LUMO gap
-goal-train data=qm9 data.target=gap
-
-# Override cutoff
-goal-train data=md17_aspirin data.cutoff=6.0
+# Override cutoff (keep data and model cutoffs in sync)
+goal-train --config-name simurgh_md17 data.cutoff=6.0
 ```
 
 Install optional dependencies for SPICE (HDF5):
@@ -715,94 +671,85 @@ GOAL supports two model paradigms:
 | **Modular** | Backbone → NodeFeatures → Head → property dict | `model.backbone` + `model.head` | Mixing backbones and heads freely |
 | **Monolithic** | Model → property dict directly | `model.backbone` + `model.head: null` | External self-contained architectures |
 
-**Modular** models separate the backbone (feature extraction) from the head (property prediction). Any backbone can be paired with any compatible head. All built-in backbones (HyperSpec, InvariantGNN, DeepSet, HyperSet, LucidSet) are modular.
+**Modular** models separate the backbone (feature extraction) from the head (property prediction). Any backbone can be paired with any compatible head. The built-in modular backbones are SIMURGH ARACE (the default), the legacy ACE-first SIMURGH, HyperSpec, and InvariantGNN.
 
-**Monolithic** models handle everything internally — embedding, interaction, readout, and property prediction — in a single `forward()` call. They return a dictionary of predicted properties directly (the same format heads produce). Set `head: null` in the config to use a monolithic model. This capability exists for users who want to bring their own self-contained architecture and use GOAL's training infrastructure without adopting the backbone→head split.
+**Monolithic** models handle everything internally — embedding, interaction, readout, and property prediction — in a single `forward()` call. They return a dictionary of predicted properties directly (the same format heads produce). Set `head: null` in the config to use a monolithic model.
 
 The `MonolithicModel` protocol in `goal.ml.nn.models.base` defines the contract: `forward(graph) → dict[str, Tensor]` and an `output_keys` property declaring which keys consumers can expect.
 
 ---
 
-### Modular Backbones
+### SIMURGH — the native GOAL force field
 
-#### HyperSpec (equivariant)
+SIMURGH is an E(3)-equivariant interatomic potential built around **Potential Artisans**: one dedicated pairwise energy module per unordered element pair (H–H, H–C, C–O, …). This is *not* a generic mixture-of-experts — routing is deterministic by chemistry (each edge goes to exactly one artisan, selected by its element pair), every artisan runs every step under a static-shape zero-masking schedule (DDP-safe, no `find_unused_parameters`), and each artisan carries a learnable gate that is monitored to detect expert collapse.
 
-E(3)-equivariant graph neural network using spherical harmonics and tensor products.
+#### ARACE — the default architecture (`simurgh_arace`)
 
-```bash
-goal-train model=hyperspec
+**ARACE = ARtisan + Atomic Cluster Expansion.** Potential artisans are the **primary computation at every layer**, alternating with ACE message passing:
+
+```
+nodes → [Artisan layer → ACE block] × N rounds → energy + forces
+
+┌─────────────────────────────────────────────────────┐
+│ ARTISAN LAYER L                                     │
+│   For each edge (i→j) routed to its pair artisan:  │
+│   h_AB   = EquivLinear(h[row]) + EquivLinear(h[col])│
+│   h_pair = TP(h_AB, Y^l(r̂), RadialMLP(d))          │
+│   E_L    = MLP(scalars(h_pair)) → (E,) scalar      │
+│   E_atom += index_add(row, 0.5 × E_L × cutoff)     │
+│   h_pair forwarded to ACE block                     │
+└─────────────────────────────────────────────────────┘
+          ↓ h_pair (E, irreps) equivariant edge features
+┌─────────────────────────────────────────────────────┐
+│ ACE MESSAGE PASSING BLOCK L                         │
+│   agg_i  = Σ_j h_pair_{j→i} / N̄                    │
+│   h_new  = RMSNorm(EquivLinear(agg) + h)  residual  │
+└─────────────────────────────────────────────────────┘
+          ↓ h_new (N, irreps) updated node features
+          repeat for num_rounds
+
+E_total = E_atomic + scale × Σ_L E_artisan_L
+F       = −∂E_total/∂r   via autograd
 ```
 
-Key parameters:
-- `hidden_channels: 128` — feature dimension
-- `num_interactions: 3` — message passing layers
-- `lmax: 2` — maximum spherical harmonics order
-- `cutoff: 5.0` — interaction radius (Å)
-- `num_radial_basis: 8` — radial basis functions
+What makes this different from MACE-style models (and from the legacy SIMURGH below):
 
-Output irreps: `128x0e+128x1o+128x2e` (scalars + vectors + rank-2 tensors)
+- **Artisans are primary, not auxiliary.** Each round *starts* with the element-pair artisans; there is no separate environment-dressing phase. The first artisan layer operates directly on the atomic-number embeddings.
+- **The ACE block aggregates artisan edge features, not node→node messages.** Where MACE builds messages inside the interaction block, ARACE's ACE block simply pools the equivariant pair representations `h_pair` that the artisans already produced onto the destination nodes, so artisan layer `L+1` sees a richer chemical context than layer `L`.
+- **Per-round energy decomposition.** Every round contributes its own pair energy `E_L` (logged as `energy_round_{L}` during training) rather than a single readout at the end — a built-in diagnostic for collapsed rounds.
+- **Pair-specific computation.** Every element pair gets its own equivariant network (shared symmetric endpoint embedding → CG tensor product with the bond direction, radially weighted → invariant scalar readout), instead of one shared interaction conditioned on species.
+- **E(3) equivariance is maintained throughout.** The only transition to invariants is the scalar energy readout inside each artisan.
 
-#### Invariant GNN
+Building blocks: `ArtisanLayer` ([blocks/artisans.py](src/goal/ml/nn/blocks/artisans.py)), `AceBlock` / `AraceRound` ([blocks/ace_block.py](src/goal/ml/nn/blocks/ace_block.py)), assembled by `SimurghAraceBackbone` ([models/simurgh/backbone_arace.py](src/goal/ml/nn/models/simurgh/backbone_arace.py)).
 
-SchNet-like invariant backbone using only scalar features. Faster than equivariant models; use for baselines or when equivariance isn't needed.
+#### ACE-first — the legacy architecture (`simurgh` / `simurgh_ace_first`)
 
-```bash
-goal-train model=invariant_gnn
-```
+The original SIMURGH pipeline: ACE-style **environment dressing first** (MACE-style tensor-product message passing, optional body-order expansion), then the artisan bank as an **auxiliary readout at the end** contributing gated, cosine-tapered pair energies. Preserved and fully supported — select it via `model.backbone.name: simurgh` (see `configs/ml/simurgh_ace_first_gmd26.yaml`), just no longer the default.
 
-Output irreps: `128x0e` (scalars only)
+#### Model zoo
 
-#### DeepSet
-
-Edge-based invariant backbone inspired by the SCAI project. Embeds atoms, expands edge distances with Bessel radial basis, projects source/target atoms and distances into a shared feature space, applies an edge interaction MLP, and scatter-aggregates to per-node invariant features.
-
-```bash
-goal-train model=deepset
-```
-
-Key parameters:
-- `embedding_dim: 128` — atomic embedding dimension
-- `hidden_channels: 128` — feature dimension
-- `num_filters: 128` — projected feature space size
-- `num_radial_basis: 20` — Bessel radial basis functions
-- `transform_depth: 2` — layers in projection MLPs
-- `cutoff: 5.0` — interaction radius (Å)
-
-Output irreps: `128x0e` (scalars only)
-
-#### HyperSet ⚠️
-
-> **Not implemented.** The original SCAI HyperSet was intended to route edge features through atom-type–specific expert MLPs, but the implementation never diverged from DeepSet. Instantiation raises `NotImplementedError`. Use `deepset` instead.
+| Registry name | Kind | Description |
+|---|---|---|
+| `simurgh_arace` | modular | **Default.** ARACE architecture — artisan layer + ACE block alternating each round |
+| `simurgh` (alias `simurgh_ace_first`) | modular | Legacy — ACE dressing first, artisan bank as final readout |
+| `monolithic_arace` | monolithic | ARACE as a self-contained model (computes its own forces) — for research/ablation |
+| `simurgh_monolithic` | monolithic | Legacy ACE-first SIMURGH without the backbone/head split |
+| `hyperspec` | modular | E(3)-equivariant GNN baseline (spherical harmonics + tensor products) |
+| `invariant_gnn` | modular | SchNet-like invariant baseline (scalars only) |
+| `monolithic_example` | monolithic | Minimal reference implementation of the `MonolithicModel` protocol |
 
 ```bash
-# Will raise NotImplementedError at instantiation
-goal-train model=hyperset
-```
-
-#### LucidSet ⚠️
-
-> **Not implemented.** The pairwise distance-binned mixture-of-experts approach requires an external atom-references dictionary and creates O(Z² × bins) expert modules, which does not scale within GOAL's paradigm. Instantiation raises `NotImplementedError`. Use `deepset` instead.
-
-```bash
-# Will raise NotImplementedError at instantiation
-goal-train model=lucidset
+goal-train                                        # simurgh_arace (default config)
+goal-train --config-name simurgh_ace_first_gmd26  # legacy ACE-first
+goal-train --config-name monolithic_arace_gmd26   # monolithic ARACE
+goal-train --config-name hyperspec_md17           # HyperSpec baseline
 ```
 
 ---
 
 ### Monolithic Models
 
-Monolithic models bypass the backbone→head split. They take an `AtomicGraph` and return a property dictionary directly. This capability is provided for external users who want to bring their own self-contained architecture and use GOAL's training loop.
-
-#### Monolithic Example
-
-A minimal demonstration model that embeds atoms, applies a small MLP readout to obtain per-atom energy contributions, sums to total energy, and derives forces via autograd.
-
-```bash
-goal-train model=monolithic_example
-```
-
-> **Note:** This is intentionally simplistic. For real tasks, use a modular backbone + head combination.
+Monolithic models bypass the backbone→head split. They take an `AtomicGraph` and return a property dictionary directly. `monolithic_arace` and `simurgh_monolithic` are the self-contained counterparts of the two SIMURGH architectures; `monolithic_example` is a minimal demonstration model (embedding → MLP readout → autograd forces) for users bringing their own architecture.
 
 ---
 
@@ -923,7 +870,7 @@ training:
       weight: 1.0
 ```
 
-See `configs/model/invariant_gnn_qm9.yaml` for a complete QM9 multi-property example.
+Loss components declared in `training.losses` are matched to the merged prediction keys by name.
 
 ---
 
@@ -941,7 +888,7 @@ Each property loss supports a configurable loss function via the `fn` parameter:
 | `huber` | Huber Loss | Combines MSE + MAE (delta = 1.0) |
 | `smooth_l1` | Smooth L1 | Like Huber with beta = 1.0 |
 
-Configure per-property in `configs/training/default.yaml`:
+Configure per-property in the `training.losses` section of your `configs/ml/*.yaml`:
 
 ```yaml
 losses:
@@ -1016,21 +963,15 @@ goal-train 'training.losses=[{name: energy, weight: 4.0, fn: mse}, {name: forces
 ## 🟡 Foundation Model Adapters
 <!-- ═══════════════════════════════════════════════════════════════════ -->
 
-Adapters wrap pre-trained foundation models (MACE, FairChem/UMA) as GOAL backbones. They translate between the foundation model's interface and GOAL's backbone protocol.
+`MACEAdapter` / `UMAAdapter` wrap pre-trained MACE and FairChem/UMA models as GOAL backbones for **feature extraction and inference**, translating between the foundation model's interface and GOAL's backbone protocol.
 
-```bash
-# Fine-tune MACE-large
-goal-finetune model.backbone.name=mace-large model.backbone.pretrained=true
-
-# Fine-tune UMA-small
-goal-finetune model.backbone.name=uma-small model.backbone.pretrained=true
-```
+To **fine-tune** these models, use the trainable `mace_finetune` / `uma_finetune` backbones instead — see [Fine-Tuning](#-fine-tuning).
 
 Install adapter dependencies:
 
 ```bash
-pip install -e ".[mace]"       # for MACE adapters
-pip install -e ".[fairchem]"   # for FairChem/UMA adapters
+pip install "mace-torch>=0.3.16"   # MACE (standalone venv — see Installation note)
+pip install fairchem-core          # FairChem / UMA
 ```
 
 ---
@@ -1350,11 +1291,7 @@ Simulate larger batch sizes without increasing GPU memory:
 goal-train trainer.accumulate_grad_batches=4   # effective batch = batch_size × 4
 ```
 
-Or use the dynamic scheduler callback:
-
-```bash
-goal-train callbacks=grad_accumulation
-```
+Or use the dynamic scheduler — uncomment the `grad_accumulation` block in the `callbacks:` section of your `configs/ml/*.yaml`.
 
 ### Exponential Moving Average (EMA)
 
@@ -1369,18 +1306,14 @@ training:
 
 ### Stochastic Weight Averaging (SWA)
 
-Alternative to EMA — averages weights during the last portion of training:
-
-```bash
-goal-train callbacks=swa
-```
+Alternative to EMA — averages weights during the last portion of training. Uncomment the `swa` block in the `callbacks:` section of your `configs/ml/*.yaml` (and disable `training.ema` first — they are mutually exclusive).
 
 ### Sanity Validation Check
 
 Before the first training epoch, Lightning runs a short validation sanity check to catch data loading, metric computation, or model errors early. This is enabled by default:
 
 ```yaml
-# configs/trainer/default.yaml
+# trainer: section of configs/ml/*.yaml
 num_sanity_val_steps: 2   # run 2 val batches before training
                           # 0 = skip, -1 = full validation set
 ```
@@ -1402,6 +1335,15 @@ goal-train trainer.num_sanity_val_steps=-1
 <!-- ═══════════════════════════════════════════════════════════════════ -->
 
 GOAL provides three levels of hyperparameter optimisation, all fully config-driven.
+
+### ARACE search space (recommended starting point)
+
+`configs/ml/simurgh_gmd26_hpo.yaml` composes the default ARACE experiment and defines a Ray Tune search space over the architecture's key dimensions — `num_rounds`, `artisan.hidden_irreps`, `artisan.num_layers`, `artisan.radial_hidden`, `artisan.n_scalar_out`, `share_artisan_weights`, plus log-uniform `lr` and `weight_decay`:
+
+```bash
+pip install -e ".[tune]"   # installs ray[tune] + optuna
+goal-tune --config-dir configs/ml --config-name simurgh_gmd26_hpo
+```
 
 ### Basic: Lightning Tuner
 
@@ -1531,25 +1473,23 @@ goal-tune hparams_search=wandb_sweep hparams_search.sweep_id=<SWEEP_ID>
 
 ### Default Callbacks
 
-The default callback group (`callbacks=default`) includes:
-- **ModelCheckpoint** — save top-k checkpoints by validation loss, plus `last.ckpt`
-- **EarlyStopping** — stop training after 100 epochs with no improvement
+Callbacks are declared inline in the `callbacks:` section of each `configs/ml/*.yaml` (plus a top-level `checkpoint_manager:` block). The default set includes:
+
+- **GOALCheckpointManager** — three checkpoint pools: top-k by validation metric, fixed-interval, and `last.ckpt` for crash recovery; freezes model source and packs shippable `.simurgh` archives
+- **EarlyStopping** — stop when `val/forces_mae` plateaus
 - **RichModelSummary** — rich-formatted model summary
-- **RichProgressBar** — rich-formatted training progress
+- **GOALRichProgressBar** — stage-aware training progress (shows the active loss-curriculum stage)
+- **LearningRateMonitor** and **RichLoggingCallback** — always active via code
 
 ### Additional Callbacks
 
-| Callback | Config | Description |
-|----------|--------|-------------|
-| Stochastic Weight Averaging | `callbacks=swa` | Average weights during late training |
-| Backbone Finetuning | `callbacks=backbone_finetuning` | Gradual unfreezing for fine-tuning |
-| Gradient Accumulation Scheduler | `callbacks=grad_accumulation` | Dynamic accumulation steps |
+Uncomment the corresponding block in the `callbacks:` section to enable: `StochasticWeightAveraging`, `BackboneFinetuning` (gradual unfreezing), `GradientAccumulationScheduler`, `EMAWeightAveraging`, `ThroughputMonitor`.
 
 Override callback parameters:
 
 ```bash
-goal-train callbacks.model_checkpoint.save_top_k=5
 goal-train callbacks.early_stopping.patience=200
+goal-train checkpoint_manager.top_k.k=3
 ```
 
 ---
@@ -1558,42 +1498,33 @@ goal-train callbacks.early_stopping.patience=200
 ## 🟣 Logging
 <!-- ═══════════════════════════════════════════════════════════════════ -->
 
-GOAL supports all Lightning loggers. Enable via the `logger` config group:
+GOAL supports all Lightning loggers. They are declared inline in the `logger:` section of each `configs/ml/*.yaml` — CSV and W&B are enabled by default; uncomment the others to activate them. Multiple loggers run simultaneously.
 
-```bash
-goal-train logger=wandb
-goal-train logger=tensorboard
-goal-train logger=csv
-```
+| Logger | Notes |
+|--------|-------|
+| Weights & Biases | Project: `goal`, requires `wandb` login (enabled by default) |
+| CSV | Simple CSV file logging (enabled by default) |
+| TensorBoard | Saves to `output_dir/tensorboard/` |
+| MLflow | MLflow tracking server |
+| Neptune | Requires `NEPTUNE_API_TOKEN` |
+| Aim | Local `.aim` repo, open with `aim up` |
+| Comet | Comet.ml experiment tracking |
 
-| Logger | Config | Notes |
-|--------|--------|-------|
-| Weights & Biases | `logger=wandb` | Project: `goal`, requires `wandb` login |
-| TensorBoard | `logger=tensorboard` | Saves to `output_dir/tensorboard/` |
-| CSV | `logger=csv` | Simple CSV file logging |
-| MLflow | `logger=mlflow` | MLflow tracking server |
-| Neptune | `logger=neptune` | Requires `NEPTUNE_API_TOKEN` |
-| Aim | `logger=aim` | Local `.aim` repo, open with `aim up` |
-| Comet | `logger=comet` | Comet.ml experiment tracking |
-
-Use multiple loggers:
-
-```bash
-goal-train logger=wandb,csv
-```
+ARACE runs additionally log the architecture-specific diagnostics: per-round energy contributions (`train/energy_round_{L}`, `val/energy_round_{L}` — watch for a round collapsing to zero) and every artisan gate at validation time (`gates/round{L}/{pair}` — a gate drifting to near-zero signals expert collapse).
 
 ### Run Naming Convention
 
 Every run is automatically named with a **timestamp + dataset + model** pattern:
 
 ```
-{date}_{time}_{dataset_type}_{model_backbone}
+{date}_{time}_{dataset_type}_{model_backbone}{run_name_suffix}
 ```
 
-For example: `2026-04-09_14-30-45_xyz_hyperspec`
+For example: `2026-07-07_14-30-45_trajectory_simurgh_arace_fragment_duplication`
 
 This naming is applied consistently to:
-- Output directories (`logs/train/runs/...`)
+
+- Output directories (`logs/{task_name}/runs/...`)
 - Logger run names (W&B, TensorBoard, MLflow, etc.)
 - Hydra sweep directories
 
@@ -1609,38 +1540,68 @@ goal-train run_name=my_custom_experiment
 ## 🟣 Configuration System
 <!-- ═══════════════════════════════════════════════════════════════════ -->
 
-GOAL uses [Hydra](https://hydra.cc/) for composable configuration. Every aspect of training is controlled by YAML config files that can be overridden from the command line.
+GOAL uses [Hydra](https://hydra.cc/) with **self-contained experiment configs**: every run is described by a single file in `configs/ml/` (data, model, trainer, losses, checkpointing, logging, distributed strategy — all in one place, every option documented inline). Select a file with `--config-name` and override any field from the command line.
 
-### Config Groups
+### Experiment Configs (`configs/ml/`)
 
-| Group | Path | Options |
-|-------|------|---------|
-| Data | `configs/data/` | `xyz`, `hdf5`, `lmdb`, `trajectory`, `md17_aspirin`, `md17_ethanol`, `rmd17_aspirin`, `ani1`, `ani1x`, `qm9` |
-| Model | `configs/model/` | `hyperspec`, `invariant_gnn`, `deepset`, `hyperset`⚠️, `lucidset`⚠️, `monolithic_example` |
-| Trainer | `configs/trainer/` | `default`, `gpu`, `ddp`, `fsdp`, `model_parallel`, `cpu`, `mps`, `ddp_sim` |
-| Training | `configs/training/` | `default` |
-| Strategy | `configs/strategy/` | `ddp`, `fsdp`, `fsdp2`, `deepspeed_zero1`, `deepspeed_zero2`, `deepspeed_zero3` |
-| Callbacks | `configs/callbacks/` | `default`, `none`, `swa`, `backbone_finetuning`, `grad_accumulation` |
-| Logger | `configs/logger/` | `wandb`, `tensorboard`, `csv`, `mlflow`, `neptune`, `aim`, `comet` |
-| Hparams Search | `configs/hparams_search/` | `basic`, `ray_tune`, `wandb_sweep` |
+| Config | Model | Notes |
+|--------|-------|-------|
+| `simurgh_gmd26` | `simurgh_arace` | **Default** — ARACE on GMD-26 |
+| `simurgh_gmd26_hpo` | `simurgh_arace` | ARACE hyperparameter search (Ray Tune) |
+| `simurgh_ace_first_gmd26` | `simurgh` | Legacy ACE-first SIMURGH on GMD-26 |
+| `monolithic_arace_gmd26` | `monolithic_arace` | Monolithic ARACE (research/ablation) |
+| `simurgh_md17` | `simurgh` | Legacy SIMURGH on MD17 |
+| `hyperspec_md17` | `hyperspec` | HyperSpec baseline on MD17 |
+
+### The default model config (ARACE)
+
+The `model:` section of `configs/ml/simurgh_gmd26.yaml`:
+
+```yaml
+model:
+  backbone:
+    name: simurgh_arace
+    num_rounds: 2                  # artisan + ACE rounds
+    share_artisan_weights: false   # true = one artisan bank for all rounds
+    cutoff: ${data.cutoff}         # must match the data cutoff
+    embedding_dim: 32
+    num_elements: 120
+    avg_num_neighbors: null        # auto-computed from the training set
+    artisan:                       # per-element-pair equivariant artisans
+      architecture: equivariant
+      hidden_irreps: "16x0e + 16x1o + 16x2e"
+      num_layers: 1                # depth of each artisan (tunable)
+      num_rbf: 8
+      radial_hidden: 32
+      n_scalar_out: 16
+      final_hidden: 16
+      element_conditioned: true
+    atomic_energies:
+      mode: learned                # or "dataset" (LSQ) / "provided" (DFT)
+    scale: null
+  head:
+    name: energy_forces            # conservative forces via -∂E/∂r
+    irreps_in: ${model.backbone.artisan.hidden_irreps}
+    hidden_dim: 128
+```
+
+Switching architectures is a one-line change — `model.backbone.name: simurgh` selects the legacy ACE-first backbone (which uses `dressing_kwargs` / `artisan_config` keys instead; see `configs/ml/simurgh_ace_first_gmd26.yaml` for a ready-made file).
 
 ### Override Examples
 
 ```bash
-# Change model and data format
-goal-train model=invariant_gnn data=hdf5
+# Pick a different experiment file
+goal-train --config-name simurgh_ace_first_gmd26
 
 # Override nested parameters
 goal-train training.optimizer.lr=0.0005 training.ema.decay=0.9999
+goal-train model.backbone.num_rounds=3 model.backbone.share_artisan_weights=true
 
 # Change loss weights
 goal-train training.losses.0.weight=1.0 training.losses.1.weight=50.0
 
 # Multi-run sweep
 goal-train -m training.optimizer.lr=0.001,0.0005,0.0001
-
-# Disable callbacks
-goal-train callbacks=none
 ```
 
 ### Output Directory
@@ -1648,11 +1609,14 @@ goal-train callbacks=none
 Each run creates a timestamped output directory:
 
 ```
-logs/train/runs/2026-04-09_14-30-45_xyz_hyperspec/
+logs/simurgh_gmd26/runs/2026-07-07_14-30-45_trajectory_simurgh_arace_fragment_duplication/
 ├── checkpoints/
 │   ├── epoch_001.ckpt
-│   └── last.ckpt
-├── train.log
+│   ├── last.ckpt
+│   ├── frozen_source/       # frozen model source for self-contained checkpoints
+│   ├── config.yaml          # resolved config
+│   └── metadata.json
+├── csv_logs/
 └── .hydra/
     ├── config.yaml          # resolved config
     ├── hydra.yaml
@@ -1667,10 +1631,14 @@ logs/train/runs/2026-04-09_14-30-45_xyz_hyperspec/
 
 | Command | Description |
 |---------|-------------|
-| `goal-train` | Train a model |
+| `goal-train` (alias `goal-train-ml`) | Train a model |
 | `goal-eval` | Evaluate a checkpoint on test data |
-| `goal-finetune` | Fine-tune a pre-trained model |
+| `goal-finetune` | Fine-tune via a foundation adapter + head |
+| `goal-finetune-upet` | Fine-tune a UPET/PET model via metatrain (`mtt train`) |
 | `goal-tune` | Hyperparameter search (LR finder, Ray Tune, W&B Sweeps) |
+| `goal-simulate` (`goal-simulate-mts`) | Run MD / multi-timescale MD |
+| `goal-inspect` | Inspect a trained checkpoint |
+| `goal-pack-archive` | Pack a checkpoint into a self-contained `.simurgh` archive |
 
 All commands accept Hydra overrides:
 
@@ -1683,7 +1651,7 @@ Module-based invocation (equivalent):
 ```bash
 python -m goal.ml.cli.train trainer=ddp data=hdf5
 python -m goal.ml.cli.evaluate ckpt_path=/path/to/ckpt
-python -m goal.ml.cli.finetune model.backbone.pretrained=true
+python -m goal.ml.cli.train --config-name finetune/mace
 python -m goal.ml.cli.tune hparams_search=basic
 ```
 

@@ -121,6 +121,13 @@ data:
   energy_key: energy # key in ASE atoms.info / ExtXYZ properties
   forces_key: forces # key in ASE atoms.arrays / ExtXYZ arrays
 
+  # Custom label keys (MACE/FairChem-style) — overrides the *_key lines above.
+  # Missing configured key → clear error listing the keys present in the file.
+  # key_mapping:
+  #   energy: REF_energy
+  #   forces: REF_forces
+  #   stress: virial
+
   # Merge strategy for multi-file splits (Mode 2/3/4)
   # "sequential" — concatenate in sorted order (reproducible)
   # "random"     — shuffle once at load time
@@ -130,14 +137,50 @@ data:
   split_ratio: [0.8, 0.1, 0.1]
   split_seed: 97
 
+  # ── Fragment labels (for model.backbone.fragment_interaction) ─────
+  # Attach (N,) int64 connected-component labels under a SHORT covalent
+  # cutoff to every graph, so separate molecules get separate labels even
+  # though they sit inside the (much longer) interaction cutoff.  Computed
+  # once at dataset-load time and renumbered per graph during batching.
+  # Needed only when model.backbone.fragment_interaction is enabled — false
+  # here since this file has both add-ons off.  See
+  # configs/ml/simurgh_gmd26.yaml for the full explanation.
+  compute_fragment_index: false
+  fragment_covalent_cutoff: 1.8 # Å; ~2.4 for metal-ligand bonds
+
+  # How to split a structure into fragments:
+  #   connected        distance graph (no rdkit, PBC-correct, never fails)
+  #   rdkit_components components of the perceived molecule
+  #   rotatable        non-ring single bonds → CH3/CH2/COOH groups
+  #   brics            BRICS retrosynthetic rules
+  #   recap            RECAP cleavage rules
+  # GMD structures are single connected molecules, so `connected` gives
+  # K=1 and the fragment module is a no-op; `rotatable` is the scheme
+  # that produces usable fragments there.  Full table with measured
+  # fragment counts in configs/ml/simurgh_gmd26.yaml.
+  fragment_scheme: connected
+  fragment_charge: 0 # total charge for rdkit bond perception
+  fragment_on_failure: fallback # or "raise"
+
+  # Hints — BRICS/RECAP rules are hard-coded in rdkit, so chemistry hints
+  # live here.  keep_groups works with every scheme; smarts drives
+  # `fragment_scheme: custom`.  Measured examples in
+  # configs/ml/simurgh_gmd26.yaml.
+  fragment_keep_groups: null # e.g. ["C(=O)O"] — atoms that stay together
+  fragment_smarts: null # e.g. ["[CX4]-[CX4]"] — bonds to cut (custom)
+
+
 # ─────────────────────────────────────────────────────
 # MODEL
 # ─────────────────────────────────────────────────────
 # backbone.name options:
 #   "monolithic_arace"   — SIMURGH ARACE: artisans + ACE alternating,
 #                          monolithic (this file)
-#   "simurgh"             — E(3)-equivariant artisan-bank force field
-#   "simurgh_monolithic"  — SIMURGH without backbone/head split (inference)
+#   "simurgh_arace"       — DEFAULT: same ARACE architecture, modular
+#                          (backbone + head; see configs/ml/simurgh_gmd26.yaml)
+#   "simurgh"             — legacy ACE-dressing-first artisan-bank model
+#                          (alias: "simurgh_ace_first")
+#   "simurgh_monolithic"  — legacy SIMURGH without backbone/head split
 #   "hyperspec"          — E(3)-equivariant GNN (HyperSpec)
 #   "invariant_gnn"      — invariant SchNet-like GNN
 #   "monolithic_example" — minimal reference monolithic model
@@ -219,6 +262,58 @@ model:
       n_scalar_out: 16 # invariant scalars before the energy MLP
       final_hidden: 16 # energy MLP hidden width
       element_conditioned: true # modulate TP weights by destination element
+
+    # ══ OPTIONAL ADD-ON MODULES ═════════════════════════════════════
+    # The monolithic variant accepts the same two optional add-ons as the
+    # modular backbone, with identical keys and identical physics.  Both
+    # are OFF here.  Each is enabled purely by the PRESENCE of its config
+    # section, so the switch is a comment: uncomment the block to enable,
+    # comment it out to disable (an empty section also counts as absent).
+    # Disabled means the block never builds the module — zero parameters,
+    # zero overhead, forward pass bit-identical to plain ARACE.
+    # Full documentation of both modules, including how to run the
+    # four-way ablation from a single file, lives in
+    # configs/ml/simurgh_gmd26.yaml.
+    #
+    # ── Equivariant Fragment Interaction (optional) ─────────────────
+    # A convolution over the fragment graph, from the same e3nn
+    # primitives as the pair artisans:
+    #   f_k = mean_{i∈k} h_i,  c_k = mean_{i∈k} r_i
+    #   Δh_i = Linear( Σ_l TP(f_l, Y^l(r̂_kl); w(d_kl)) / n_k )
+    # Equivariant at every angular order — the correction spans l=0, l=1
+    # AND l=2, and carries WHERE the other fragment is via the spherical
+    # harmonics of the inter-centroid direction.  Pairs are cut off at
+    # `cutoff` (defaults to the backbone radius) and tapered, so the model
+    # stays local.  A lone fragment (K=1) gets exactly zero correction.
+    # REQUIRES data.compute_fragment_index: true.
+    # fragment_interaction:
+    #   irreps_hidden: null # null = reuse artisan.hidden_irreps
+    #   num_rbf: 8
+    #   radial_hidden: 32
+    #   num_layers: 1
+    #   init_zero: true # start as an exact no-op, learn to activate
+    #   max_fragments: 512 # guard: pair enumeration is O(K²)
+    #   # cutoff: 8.0 # omit to inherit the backbone cutoff
+    #
+    # ── Adaptive Depth Gate (optional) ──────────────────────────────
+    # Per-atom gate over each round's update: soft and differentiable
+    # during training, hard-thresholded at inference so converged atoms
+    # exit early.  Invariant inputs (l=0 scalars + ‖Δh‖/‖h‖); the gate
+    # value must be invariant or equivariance breaks, which is exactly
+    # how e3nn's own nn.Gate works.  `per_irrep: true` gives one gate per
+    # irrep block instead of one for the whole vector.
+    # Adds λ·mean(g) to the loss as "aux_loss" (returned in this model's
+    # property dict, folded into train/total) and logs
+    # {train,val}_gate/gate_mean_round_{L} per round — all gate curves go
+    # to the train_gate/ and val_gate/ sections so they stay out of the
+    # energy/force metrics.  See configs/ml/simurgh_gmd26.yaml, LOGGING,
+    # for the full section map.
+    # adaptive_gate:
+    #   n_scalar: 16
+    #   hard_threshold: 0.5 # inference cut: g > threshold → atom updates
+    #   aux_loss_weight: 0.01 # λ; 0.0 disables the sparsity penalty
+    #   init_bias: 1.0 # sigmoid(1) ≈ 0.73 → the gate starts OPEN
+    #   per_irrep: true # one invariant gate per irrep block
 
   # ── Task head ──────────────────────────────────────────────────────
   # Monolithic backbone — returns the property dict (energy + autograd

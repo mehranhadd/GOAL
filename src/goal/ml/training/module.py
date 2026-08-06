@@ -175,6 +175,20 @@ class GOALModule(L.LightningModule):
             ]
             if gate_list:
                 predictions["gate_values"] = torch.stack(gate_list)
+
+        # Adaptive-depth-gate side channels (ARACE add-on).  Duck-typed,
+        # so every other backbone is silently skipped; both attributes are
+        # ``None`` unless ``model.backbone.adaptive_gate`` is configured.
+        # ``last_aux_loss`` keeps its autograd graph — :meth:`_with_aux_loss`
+        # adds it to the training total.
+        aux_loss: torch.Tensor | None = getattr(self.backbone, "last_aux_loss", None)
+        if aux_loss is not None:
+            predictions["aux_loss"] = aux_loss
+        round_gates: typing.Any = getattr(self.backbone, "last_gate_scores", None)
+        if round_gates:
+            populated: list[torch.Tensor] = [g for g in round_gates if g is not None]
+            if populated:
+                predictions["gate_scores"] = torch.stack(populated, dim=0)  # (L, N)
         return predictions
 
     def on_before_batch_transfer(self, batch: typing.Any, dataloader_idx: int) -> typing.Any:
@@ -293,8 +307,111 @@ class GOALModule(L.LightningModule):
             rank_zero_info(f"[stage] epoch={epoch} → {stage_name!r}  " f"active_weights={active}")
 
     # ------------------------------------------------------------------
+    # Logger sections
+    # ------------------------------------------------------------------
+    #
+    # Everything a run logs lands in one of a few W&B / TensorBoard
+    # sections, chosen by the text before the first ``/``:
+    #
+    #   train/      val/      — the metrics you actually watch: energy and
+    #                           force MAE/RMSE, cosine similarity, Newton
+    #                           violation, per-round energies, and the
+    #                           loss total plus its physics components.
+    #   train_gate/ val_gate/  — every gate diagnostic:
+    #                             gate_mean_round_{L}   adaptive depth gate
+    #                             aux_loss              its sparsity penalty
+    #                             gate_reg              L2 on artisan gates
+    #                             artisan/round{L}/{pair}
+    #                                                   artisan gate values
+    #                             artisan_load/{pair}   load balance (val
+    #                             artisan_load_variance only — see below)
+    #
+    # Gate curves are numerous — one per round, plus one per element pair
+    # per round — and they are for occasional inspection, not for judging
+    # a run.  Keeping them in their own section is what stops them from
+    # burying ``val/forces_mae`` in a wall of panels.
+
+    #: Loss labels that belong in the gate section rather than next to the
+    #: physics losses.  ``total`` deliberately stays in ``train/`` — it is
+    #: the whole loss, including these components.
+    GATE_LOSS_LABELS: typing.ClassVar[frozenset[str]] = frozenset({"aux_loss", "gate_reg"})
+
+    @staticmethod
+    def _gate_prefix(prefix: str) -> str:
+        """``"train/"`` → ``"train_gate/"``, ``"val/"`` → ``"val_gate/"``."""
+        return f"{prefix.rstrip('/')}_gate/"
+
+    def _log_artisan_gates(self, batch: AtomicGraph, prefix: str) -> None:
+        """Log every artisan gate as ``{split}_gate/artisan/round{L}/{pair}``.
+
+        These are the learnable per-element-pair gates of the artisan bank
+        — ``nn.Parameter`` scalars, so reading them costs nothing and they
+        can be logged on both train and validation.  A gate drifting to
+        near-zero means that element pair has been switched off, which is
+        the artisan equivalent of expert collapse.
+
+        Duck-typed via ``backbone.gates()``; a silent no-op for backbones
+        without an artisan bank.  These are the most numerous curves a run
+        produces — ``K*(K+1)/2 x num_rounds`` of them — which is exactly
+        why they are filed under the gate section instead of next to the
+        energy and force metrics.
+        """
+        gates_fn: typing.Any = getattr(self.backbone, "gates", None)
+        if not callable(gates_fn):
+            return
+        gate_values: dict[str, torch.Tensor] = gates_fn()
+        if not gate_values:
+            return
+        artisan_prefix: str = f"{self._gate_prefix(prefix)}artisan/"
+        self.log_dict(
+            {f"{artisan_prefix}{k}": v for k, v in gate_values.items()},
+            batch_size=batch.num_graphs,
+            sync_dist=True,
+            on_step=prefix.startswith("train"),
+            on_epoch=True,
+        )
+
+    # ------------------------------------------------------------------
     # Step hooks
     # ------------------------------------------------------------------
+
+    def _log_losses(
+        self,
+        losses: dict[str, torch.Tensor],
+        batch: AtomicGraph,
+        prefix: str,
+        on_step: bool = True,
+        prog_bar: bool = True,
+    ) -> None:
+        """Log the loss breakdown, routing gate terms to the gate section.
+
+        Physics components (and ``total``) keep the ``{prefix}`` section
+        and the progress bar; ``aux_loss`` / ``gate_reg`` move to
+        ``{prefix}_gate/`` and never reach the progress bar.
+        """
+        physics: dict[str, torch.Tensor] = {}
+        gate: dict[str, torch.Tensor] = {}
+        for label, value in losses.items():
+            target = gate if label in self.GATE_LOSS_LABELS else physics
+            target[label] = value.detach()
+
+        self.log_dict(
+            {f"{prefix}{k}": v for k, v in physics.items()},
+            batch_size=batch.num_graphs,
+            sync_dist=True,
+            prog_bar=prog_bar,
+            on_step=on_step,
+            on_epoch=True,
+        )
+        if gate:
+            self.log_dict(
+                {f"{self._gate_prefix(prefix)}{k}": v for k, v in gate.items()},
+                batch_size=batch.num_graphs,
+                sync_dist=True,
+                prog_bar=False,
+                on_step=on_step,
+                on_epoch=True,
+            )
 
     def _log_step_metrics(
         self,
@@ -321,25 +438,119 @@ class GOALModule(L.LightningModule):
                 on_epoch=True,
             )
 
+    def _log_round_energies(
+        self,
+        predictions: dict[str, torch.Tensor],
+        batch: AtomicGraph,
+        prefix: str,
+    ) -> None:
+        """Log per-round ARACE energy contributions as
+        ``{prefix}energy_round_{L}``.
+
+        Duck-typed no-op for non-ARACE backbones: the per-round totals
+        come either from the monolithic model's ``"layer_energies"``
+        prediction key or from the modular backbone's
+        ``last_round_energies`` attribute (a detached ``(L, B)``
+        snapshot of the most recent forward).  Monitors whether every
+        round keeps contributing — a round collapsing to zero is a
+        warning sign.
+        """
+        layer_e: torch.Tensor | None = predictions.get("layer_energies", None)
+        if layer_e is None:
+            layer_e = getattr(self.backbone, "last_round_energies", None)
+        if layer_e is None or layer_e.dim() != 2:
+            return
+        for round_idx in range(layer_e.shape[0]):
+            self.log(
+                f"{prefix}energy_round_{round_idx}",
+                layer_e[round_idx].detach().mean(),
+                batch_size=batch.num_graphs,
+                sync_dist=True,
+                on_step=prefix.startswith("train"),
+                on_epoch=True,
+            )
+
+    def _log_gate_scores(
+        self,
+        predictions: dict[str, torch.Tensor],
+        batch: AtomicGraph,
+        prefix: str,
+    ) -> None:
+        """Log per-round adaptive-gate means to the **gate** section.
+
+        Emits ``{train,val}_gate/gate_mean_round_{L}`` — deliberately not
+        ``train/…``, so the gate curves stay out of the section holding
+        the energy/force metrics (see "Logger sections" above).
+
+        Duck-typed no-op unless the ARACE adaptive depth gate is enabled:
+        the ``(L, N)`` gate tensor comes either from the monolithic
+        model's ``"gate_scores"`` prediction key or from the modular
+        backbone's ``last_gate_scores`` side channel (injected into
+        ``predictions`` by :meth:`forward`).
+
+        Reading the curve: ~1.0 means the gate is always open (not
+        selective — raise ``aux_loss_weight``), ~0.5 means it is
+        discriminating between atoms, and a collapse towards 0 means
+        rounds are being skipped wholesale (lower ``aux_loss_weight``).
+        """
+        gates: torch.Tensor | None = predictions.get("gate_scores", None)
+        if gates is None or gates.dim() != 2:
+            return
+        gate_prefix: str = self._gate_prefix(prefix)
+        for round_idx in range(gates.shape[0]):
+            self.log(
+                f"{gate_prefix}gate_mean_round_{round_idx}",
+                gates[round_idx].detach().mean(),
+                batch_size=batch.num_graphs,
+                sync_dist=True,
+                on_step=prefix.startswith("train"),
+                on_epoch=True,
+            )
+
+    @staticmethod
+    def _with_aux_loss(
+        losses: dict[str, torch.Tensor],
+        predictions: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Fold a model-supplied ``aux_loss`` into the loss breakdown.
+
+        Some models emit their own regularisation term alongside the
+        predictions — currently the ARACE adaptive depth gate's sparsity
+        penalty ``λ · mean(g)``, already scaled by its configured weight.
+        It is added to ``total`` and surfaced under the ``aux_loss`` label
+        so it shows up in the logged breakdown like any other component.
+
+        No config wiring is needed (and none should be: the weight lives
+        with the module that defines the term).  Models that emit no
+        ``aux_loss`` are untouched — the returned dict is the input dict.
+        """
+        aux: torch.Tensor | None = predictions.get("aux_loss", None)
+        if aux is None or "aux_loss" in losses:
+            return losses
+        return {**losses, "aux_loss": aux, "total": losses["total"] + aux}
+
     def training_step(self, batch: AtomicGraph, batch_idx: int) -> torch.Tensor:
         """Single training step -- forward, loss, logging."""
         self._maybe_advance_stage(self.current_epoch)
 
         predictions: dict[str, torch.Tensor] = self(batch)
-        losses: dict[str, torch.Tensor] = self.loss(predictions, batch)
-
-        # Loss components — kept on the progress bar for backward
-        # compatibility with existing dashboards.
-        self.log_dict(
-            {f"train/{k}": v for k, v in losses.items()},
-            batch_size=batch.num_graphs,
-            sync_dist=True,
-            prog_bar=True,
+        losses: dict[str, torch.Tensor] = self._with_aux_loss(
+            self.loss(predictions, batch), predictions
         )
+
+        # Loss components — physics terms on the progress bar under
+        # ``train/``, gate terms quietly under ``train_gate/``.
+        self._log_losses(losses, batch, prefix="train/")
         # Standard MLIP diagnostic metrics (energy_mae_per_atom,
         # forces_{mae,rmse,cosine_similarity,magnitude_mae},
         # newton_violation).
         self._log_step_metrics(predictions, batch, prefix="train/")
+        # ARACE per-round energy decomposition (no-op for other backbones).
+        self._log_round_energies(predictions, batch, prefix="train/")
+        # ARACE adaptive-gate means per round (no-op when the gate is off).
+        self._log_gate_scores(predictions, batch, prefix="train/")
+        # Per-element-pair artisan gates (no-op without an artisan bank).
+        self._log_artisan_gates(batch, prefix="train/")
         return losses["total"]
 
     def on_train_batch_end(
@@ -378,25 +589,31 @@ class GOALModule(L.LightningModule):
             else:
                 predictions = self(batch)
 
-            losses = self.loss(predictions, batch)
+            losses = self._with_aux_loss(self.loss(predictions, batch), predictions)
 
-        self.log_dict(
-            {f"val/{k}": v.detach() for k, v in losses.items()},
-            batch_size=batch.num_graphs,
-            sync_dist=True,
-            prog_bar=True,
-            on_step=True,
-            on_epoch=True,
-        )
+        self._log_losses(losses, batch, prefix="val/")
         self._log_step_metrics(predictions, batch, prefix="val/")
+        # ARACE per-round energy decomposition (no-op for other backbones).
+        self._log_round_energies(predictions, batch, prefix="val/")
+        # ARACE adaptive-gate means per round (no-op when the gate is off).
+        self._log_gate_scores(predictions, batch, prefix="val/")
 
-        # Expert load-balance diagnostic (SIMURGH only, validation only).
-        # Duck-typed — silently skipped for non-SIMURGH backbones.
+        # Per-element-pair artisan gates → val_gate/artisan/… (also logged
+        # every train step; see :meth:`_log_artisan_gates`).
+        self._log_artisan_gates(batch, prefix="val/")
+
+        # Artisan load-balance diagnostic (legacy ACE-first SIMURGH only —
+        # the ARACE backbones do not expose ``compute_artisan_loads``, so
+        # this is a no-op for them).  Stays validation-only on purpose: it
+        # runs a *full extra forward of every artisan* over the batch, far
+        # too expensive per training step.  Filed under the gate section as
+        # ``val_gate/artisan_load/…`` alongside the gate values it explains.
         if hasattr(self.backbone, "compute_artisan_loads"):
             loads: dict[str, torch.Tensor] = self.backbone.compute_artisan_loads(batch)
             load_var: torch.Tensor | None = loads.pop("load_variance", None)
+            load_prefix: str = f"{self._gate_prefix('val/')}artisan_load/"
             self.log_dict(
-                {f"val/artisan_load/{k}": v for k, v in loads.items()},
+                {f"{load_prefix}{k}": v for k, v in loads.items()},
                 batch_size=batch.num_graphs,
                 sync_dist=True,
                 on_step=False,
@@ -404,7 +621,7 @@ class GOALModule(L.LightningModule):
             )
             if load_var is not None:
                 self.log(
-                    "val/artisan_load_variance",
+                    f"{self._gate_prefix('val/')}artisan_load_variance",
                     load_var,
                     batch_size=batch.num_graphs,
                     sync_dist=True,
@@ -433,16 +650,14 @@ class GOALModule(L.LightningModule):
             else:
                 predictions = self(batch)
 
-            losses = self.loss(predictions, batch)
+            losses = self._with_aux_loss(self.loss(predictions, batch), predictions)
 
-        self.log_dict(
-            {f"test/{k}": v.detach() for k, v in losses.items()},
-            batch_size=batch.num_graphs,
-            sync_dist=True,
-            on_step=True,
-            on_epoch=True,
-        )
+        # Same split as train/val: gate terms under ``test_gate/``.
+        # ``prog_bar=False`` keeps the test loop as quiet as it was.
+        self._log_losses(losses, batch, prefix="test/", prog_bar=False)
         self._log_step_metrics(predictions, batch, prefix="test/")
+        # ARACE adaptive-gate means per round (no-op when the gate is off).
+        self._log_gate_scores(predictions, batch, prefix="test/")
 
     def _split_param_groups(
         self,

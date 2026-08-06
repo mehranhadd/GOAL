@@ -89,8 +89,10 @@ data:
 # MODEL
 # ─────────────────────────────────────────────────────
 # backbone.name options:
-#   "simurgh", "simurgh_monolithic", "monolithic_arace",
-#   "hyperspec", "invariant_gnn", "monolithic_example"
+#   "simurgh_arace" (default ARACE architecture — different config keys,
+#   see configs/ml/simurgh_gmd26.yaml), "simurgh" (legacy ACE-first, this
+#   file; alias "simurgh_ace_first"), "simurgh_monolithic",
+#   "monolithic_arace", "hyperspec", "invariant_gnn", "monolithic_example"
 #
 # head.name options:
 #   "energy_forces", "dual_forces", "direct_forces",
@@ -100,6 +102,14 @@ model:
   backbone:
     name: simurgh
     cutoff: ${model.backbone.dressing_kwargs.cutoff}
+
+    # NOTE: the optional `fragment_interaction` / `adaptive_gate` add-ons are
+    # ARACE-only — they attach to an artisan+ACE round, which this legacy
+    # backbone does not have, and `SimurghBackbone.__init__` rejects those
+    # keys.  See configs/ml/simurgh_gmd26.yaml (modular ARACE) or
+    # monolithic_arace_gmd26.yaml, where both are documented inline and
+    # enabled by uncommenting.  MD17 is single-molecule anyway, so
+    # fragment CA would see K = 1 fragment and act as a per-structure bias.
 
     # Atomic-energy baseline — elements are discovered automatically from
     # the training set. You never need to specify which elements are present.

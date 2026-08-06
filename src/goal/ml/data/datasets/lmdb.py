@@ -50,11 +50,19 @@ class LMDBDataset(BaseAtomicDataset):
         root: str | Path,
         cutoff: float,
         split: str = "train",
-        energy_key: str = "energy",
-        forces_key: str = "forces",
-        stress_key: str = "stress",
+        energy_key: str | None = None,
+        forces_key: str | None = None,
+        stress_key: str | None = None,
+        key_mapping: typing.Mapping[str, str] | None = None,
         dtype: torch.dtype = torch.float64,
         neighbor_list_backend: str = "ase",
+        compute_fragment_index: bool = False,
+        fragment_covalent_cutoff: float = 1.8,
+        fragment_scheme: str = "connected",
+        fragment_charge: int = 0,
+        fragment_on_failure: str = "fallback",
+        fragment_smarts: typing.Sequence[str] | None = None,
+        fragment_keep_groups: typing.Sequence[str] | None = None,
     ) -> None:
         super().__init__(
             root=root,
@@ -62,10 +70,22 @@ class LMDBDataset(BaseAtomicDataset):
             split=split,
             dtype=dtype,
             neighbor_list_backend=neighbor_list_backend,
+            compute_fragment_index=compute_fragment_index,
+            fragment_covalent_cutoff=fragment_covalent_cutoff,
+            fragment_scheme=fragment_scheme,
+            fragment_charge=fragment_charge,
+            fragment_on_failure=fragment_on_failure,
+            fragment_smarts=fragment_smarts,
+            fragment_keep_groups=fragment_keep_groups,
         )
-        self.energy_key: str = energy_key
-        self.forces_key: str = forces_key
-        self.stress_key: str = stress_key
+        from goal.ml.data.keys import resolve_label_keys
+
+        # LMDB stores a plain dict per record; resolve which dict keys hold
+        # each property (``key_mapping`` overrides the per-key arguments).
+        key_map, _ = resolve_label_keys(energy_key, forces_key, stress_key, key_mapping)
+        self.energy_key: str = key_map["energy"]
+        self.forces_key: str = key_map["forces"]
+        self.stress_key: str = key_map["stress"]
         self._env: typing.Any = None
         self._length: int = 0
         self._open()
@@ -150,7 +170,7 @@ class LMDBDataset(BaseAtomicDataset):
             edge_lengths = nl.edge_lengths
             unit_shifts = nl.unit_shifts
 
-        return AtomicGraph(
+        graph: AtomicGraph = AtomicGraph(
             positions=positions,
             atomic_numbers=atomic_numbers,
             cell=cell,
@@ -163,6 +183,7 @@ class LMDBDataset(BaseAtomicDataset):
             forces=_to_tensor(data.get(self.forces_key)),
             stress=_to_tensor(data.get(self.stress_key)),
         )
+        return self.attach_fragment_index(graph)
 
     def close(self) -> None:
         """Close the LMDB environment."""

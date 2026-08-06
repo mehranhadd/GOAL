@@ -52,161 +52,37 @@ import typing
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from e3nn.o3 import Irreps, spherical_harmonics
 from torch_geometric.utils import scatter
 
 from goal.ml.data.graph import AtomicGraph
+from goal.ml.nn.blocks.ace_block import normalise_addon_config
+from goal.ml.nn.blocks.adaptive_gate import AdaptiveDepthGate
 from goal.ml.nn.blocks.artisans import (
+    _AracePairArtisan,
     _PairRMSNorm,
-    build_artisan_edge_irreps,
     cosine_cutoff,
     enumerate_element_pairs,
     pair_label,
 )
+from goal.ml.nn.blocks.fragment_interaction import (
+    EquivariantFragmentInteraction,
+    FragmentGeometry,
+)
 from goal.ml.nn.blocks.embedding import AtomicNumberEmbedding
 from goal.ml.nn.models.simurgh.geometry import differentiable_edges
 from goal.ml.nn.primitives.linear import EquivariantLinear
-from goal.ml.nn.primitives.radial import BesselBasis, PolynomialEnvelope, RadialMLP
-from goal.ml.nn.primitives.tp import WeightedTensorProduct
 from goal.ml.registry import BACKBONE_REGISTRY, MODEL_REGISTRY
 
-
-class _AracePairArtisan(nn.Module):
-    """One equivariant element-pair artisan for the ARACE variant.
-
-    Identical in spirit to the equivariant
-    :class:`~goal.ml.nn.blocks.artisans._EquivariantArtisanCore`, but in
-    addition to the per-edge scalar energy it also *returns the
-    equivariant pair representation* ``h_pair`` so the ACE block can
-    aggregate it back onto nodes.  All learnable maps are bias-free so
-    zero-masked edges contribute exactly zero.
-
-    Parameters mirror the ``artisan.equivariant`` sub-config; see
-    :class:`MonolithicArace`.
-    """
-
-    def __init__(
-        self,
-        irreps_node: Irreps | str,
-        cutoff: float,
-        hidden_irreps: Irreps | str = "16x0e + 16x1o + 16x2e",
-        num_layers: int = 1,
-        num_rbf: int = 8,
-        radial_hidden: int = 32,
-        n_scalar_out: int = 16,
-        final_hidden: int = 16,
-        element_conditioned: bool = True,
-        n_elements: int = 120,
-    ) -> None:
-        super().__init__()
-        if num_layers < 1:
-            raise ValueError(f"num_layers must be >= 1, got {num_layers}.")
-        self.irreps_node: Irreps = Irreps(irreps_node)
-        self.irreps_hidden: Irreps = Irreps(hidden_irreps)
-        lmax: int = max((ir.l for _, ir in self.irreps_hidden), default=0)
-        self.irreps_edge: Irreps = build_artisan_edge_irreps(lmax)
-        self._element_conditioned: bool = bool(element_conditioned)
-        self._n_elements: int = int(n_elements)
-
-        # Shared symmetric node embedding — one map applied to both
-        # endpoints guarantees E(A, B) = E(B, A) under the sum.
-        self.node_embed: EquivariantLinear = EquivariantLinear(
-            self.irreps_node, self.irreps_hidden, biases=False
-        )
-
-        # CG tensor product with bond geometry.
-        self.tp: WeightedTensorProduct = WeightedTensorProduct(
-            irreps_in1=self.irreps_hidden,
-            irreps_in2=self.irreps_edge,
-            irreps_out=self.irreps_hidden,
-        )
-        self.radial_basis: BesselBasis = BesselBasis(num_basis=num_rbf, cutoff=cutoff)
-        self.envelope: PolynomialEnvelope = PolynomialEnvelope(cutoff=cutoff)
-        self.radial_mlp: RadialMLP = RadialMLP(
-            num_basis=num_rbf,
-            hidden_dim=radial_hidden,
-            num_out=self.tp.weight_numel,
-        )
-        self.element_linear: nn.Linear | None = (
-            nn.Linear(self._n_elements, self.tp.weight_numel, bias=False)
-            if element_conditioned
-            else None
-        )
-
-        # Optional deeper equivariant layers.
-        self.layers: nn.ModuleList = nn.ModuleList(
-            EquivariantLinear(self.irreps_hidden, self.irreps_hidden, biases=False)
-            for _ in range(num_layers - 1)
-        )
-        self.norms: nn.ModuleList = nn.ModuleList(
-            _PairRMSNorm(self.irreps_hidden) for _ in range(num_layers - 1)
-        )
-
-        # Invariant scalar readout (bias-free).
-        scalar_irreps: Irreps = Irreps(f"{int(n_scalar_out)}x0e")
-        self.to_scalars: EquivariantLinear = EquivariantLinear(
-            self.irreps_hidden, scalar_irreps, biases=False
-        )
-        self.energy_mlp: nn.Sequential = nn.Sequential(
-            nn.Linear(int(n_scalar_out), int(final_hidden), bias=False),
-            nn.SiLU(),
-            nn.Linear(int(final_hidden), 1, bias=False),
-        )
-
-        # Learnable gate, initialised to 1.0.
-        self.gate: nn.Parameter = nn.Parameter(torch.tensor(1.0))
-
-    def forward(
-        self,
-        feats_a: torch.Tensor,
-        feats_b: torch.Tensor,
-        edge_sh: torch.Tensor,
-        distances: torch.Tensor,
-        z_dst: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-edge pair representation and gated scalar energy.
-
-        Parameters
-        ----------
-        feats_a, feats_b : Tensor ``(E, irreps_node.dim)``
-            Equivariant node features of source / destination atom.
-        edge_sh : Tensor ``(E, irreps_edge.dim)``
-            Spherical harmonics of the edge direction.
-        distances : Tensor ``(E,)``
-            Bond lengths (zeros on masked edges are clamped internally).
-        z_dst : Tensor ``(E,)``, optional
-            Destination atomic numbers (element conditioning).
-
-        Returns
-        -------
-        tuple of Tensor
-            ``(h_pair, e_pair)`` with shapes ``(E, irreps_hidden.dim)``
-            and ``(E,)``; ``e_pair`` is already multiplied by the gate.
-        """
-        h_ab: torch.Tensor = self.node_embed(feats_a) + self.node_embed(feats_b)
-
-        d_safe: torch.Tensor = distances.clamp_min(1e-6)
-        rbf: torch.Tensor = self.radial_basis(d_safe)  # (E, num_rbf)
-        env: torch.Tensor = self.envelope(d_safe).to(h_ab.dtype).unsqueeze(-1)  # (E, 1)
-        radial_w: torch.Tensor = self.radial_mlp(rbf) * env  # (E, weight_numel)
-
-        if self._element_conditioned and self.element_linear is not None:
-            if z_dst is None:
-                raise ValueError("element_conditioned=True requires z_dst in forward()")
-            one_hot: torch.Tensor = F.one_hot(
-                z_dst.clamp(0, self._n_elements - 1),
-                num_classes=self._n_elements,
-            ).to(radial_w.dtype)
-            radial_w = radial_w * self.element_linear(one_hot)
-
-        h_pair: torch.Tensor = self.tp(h_ab, edge_sh.to(h_ab.dtype), radial_w)
-        for lin, norm in zip(self.layers, self.norms):
-            h_pair = norm(lin(h_pair) + h_pair)
-
-        scalars: torch.Tensor = self.to_scalars(h_pair)  # (E, n_scalar_out)
-        e_pair: torch.Tensor = self.gate * self.energy_mlp(scalars).squeeze(-1)  # (E,)
-        return h_pair, e_pair
+# ``_AracePairArtisan`` historically lived in this module; it now sits in
+# ``goal.ml.nn.blocks.artisans`` next to the other artisan implementations
+# and is re-exported here for backward compatibility.
+__all__ = [
+    "_AracePairArtisan",
+    "AraceBlock",
+    "AraceBackbone",
+    "MonolithicArace",
+]
 
 
 class AraceBlock(nn.Module):
@@ -244,6 +120,15 @@ class AraceBlock(nn.Module):
     avg_num_neighbors : float, optional
         Mean neighbour count used to normalise the edge → node
         aggregation.  ``None`` disables normalisation.
+    fragment_interaction_config : dict, optional
+        ``None`` (default) → no fragment channel, zero overhead.  A dict
+        builds
+        :class:`~goal.ml.nn.blocks.fragment_interaction.EquivariantFragmentInteraction`
+        with those hyperparameters.
+    adaptive_gate_config : dict, optional
+        ``None`` (default) → no depth gate, zero overhead.  A dict builds
+        :class:`~goal.ml.nn.blocks.adaptive_gate.AdaptiveDepthGate` with
+        those hyperparameters.
     """
 
     def __init__(
@@ -254,6 +139,8 @@ class AraceBlock(nn.Module):
         artisan_kwargs: dict[str, typing.Any] | None = None,
         artisans: nn.ModuleDict | None = None,
         avg_num_neighbors: float | None = None,
+        fragment_interaction_config: dict[str, typing.Any] | None = None,
+        adaptive_gate_config: dict[str, typing.Any] | None = None,
     ) -> None:
         super().__init__()
         self.irreps_node: Irreps = Irreps(irreps_node)
@@ -299,6 +186,68 @@ class AraceBlock(nn.Module):
             torch.tensor(norm_scale, dtype=torch.get_default_dtype()),
         )
 
+        # ----- Optional add-ons (None = strict no-op, no parameters) -----
+        self.fragment_interaction: EquivariantFragmentInteraction | None = None
+        if fragment_interaction_config is not None:
+            frag_kwargs: dict[str, typing.Any] = {
+                str(k): v for k, v in dict(fragment_interaction_config).items()
+            }
+            frag_kwargs.setdefault("cutoff", float(cutoff))
+            self.fragment_interaction = EquivariantFragmentInteraction(
+                irreps_node=self.irreps_node, **frag_kwargs
+            )
+        self.adaptive_gate: AdaptiveDepthGate | None = (
+            AdaptiveDepthGate(
+                irreps_node=self.irreps_node,
+                **{str(k): v for k, v in dict(adaptive_gate_config).items()},
+            )
+            if adaptive_gate_config is not None
+            else None
+        )
+
+    def _apply_addons(
+        self,
+        h: torch.Tensor,
+        h_local: torch.Tensor,
+        fragment_geometry: FragmentGeometry | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """Mix in the fragment-CA correction and apply the depth gate.
+
+        Shared by the normal and the edge-free forward paths so both
+        behave identically.  Returns ``(h_new, gate_scores, aux_loss)``;
+        with both add-ons disabled it returns ``h_local`` untouched, a
+        ``None`` gate and a zero aux loss.
+        """
+        if self.fragment_interaction is not None:
+            if fragment_geometry is None:
+                raise ValueError(
+                    "The fragment interaction is enabled but no fragment "
+                    "geometry was supplied.  Set data.compute_fragment_index: "
+                    "true in the config (and rebuild the dataset cache) so the "
+                    "graphs carry fragment labels."
+                )
+            delta_h: torch.Tensor = self.fragment_interaction(h, fragment_geometry)
+            # Plain equivariant sum: delta_h spans the full node irreps, so
+            # every angular channel gets the correction.
+            h_new: torch.Tensor = h_local + delta_h
+            # Re-normalise after mixing, reusing the block's own norm: with
+            # its gains at their init value of 1 this pass is idempotent, so
+            # an ``init_zero`` fragment module starts out exactly equal to plain
+            # ARACE.
+            h_new = self.ace_norm(h_new)
+        else:
+            h_new = h_local
+
+        gate_scores: torch.Tensor | None = None
+        aux_loss: torch.Tensor = torch.zeros((), device=h.device, dtype=h.dtype)
+        if self.adaptive_gate is not None:
+            h_new, aux_loss, gate_scores = self.adaptive_gate(
+                h_new=h_new,
+                h_prev=h,
+                training=self.training,
+            )
+        return h_new, gate_scores, aux_loss
+
     def forward(
         self,
         h: torch.Tensor,
@@ -306,8 +255,9 @@ class AraceBlock(nn.Module):
         edge_index: torch.Tensor,
         edge_sh: torch.Tensor,
         edge_lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run one artisan + ACE round.
+        fragment_geometry: FragmentGeometry | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+        """Run one artisan + ACE round, plus any enabled add-on.
 
         Parameters
         ----------
@@ -319,13 +269,19 @@ class AraceBlock(nn.Module):
             Pre-computed edge spherical harmonics (geometry only, shared
             across all blocks).
         edge_lengths : Tensor ``(E,)``
+        fragment_geometry : FragmentGeometry, optional
+            Fragment graph (centroids, pairs, spherical harmonics) — built
+            once per forward and required only when the fragment channel
+            is enabled.
 
         Returns
         -------
-        tuple of Tensor
-            ``(h_new, e_atom)`` — updated node features
-            ``(N, irreps_node.dim)`` and this layer's per-atom energy
-            contribution ``(N,)``.
+        tuple
+            ``(h_new, e_atom, gate_scores, aux_loss)`` — updated node
+            features ``(N, irreps_node.dim)``, this layer's per-atom
+            energy ``(N,)``, per-atom gate values ``(N,)`` (``None`` when
+            the gate is disabled) and this round's auxiliary loss (0-d,
+            exactly zero unless the gate is enabled and training).
         """
         num_atoms: int = h.shape[0]
         device: torch.device = h.device
@@ -351,8 +307,11 @@ class AraceBlock(nn.Module):
                 h_p, e_p = artisan(dummy_feats, dummy_feats, dummy_sh, dummy_dist, dummy_z)
                 dummy_sum = dummy_sum + 0.0 * (h_p.sum() + e_p.sum())
             agg: torch.Tensor = torch.zeros_like(h) + dummy_sum
-            h_new: torch.Tensor = self.ace_norm(self.ace_linear(agg) + h)
-            return h_new, e_atom + dummy_sum
+            h_local_empty: torch.Tensor = self.ace_norm(self.ace_linear(agg) + h)
+            h_new, gate_scores, aux_loss = self._apply_addons(
+                h, h_local_empty, fragment_geometry
+            )
+            return h_new, e_atom + dummy_sum, gate_scores, aux_loss
 
         edge_lengths = edge_lengths.to(dtype)
         cut_env: torch.Tensor = cosine_cutoff(edge_lengths, self._cutoff).to(dtype)
@@ -383,8 +342,11 @@ class AraceBlock(nn.Module):
         agg = torch.zeros_like(h)
         agg = agg.index_add(0, col, h_pair_total)
         agg = agg * self.agg_norm_scale.to(dtype)
-        h_new = self.ace_norm(self.ace_linear(agg) + h)
-        return h_new, e_atom
+        h_local: torch.Tensor = self.ace_norm(self.ace_linear(agg) + h)
+
+        # ----- Optional add-ons (fragment branch, then depth gate).
+        h_new, gate_scores, aux_loss = self._apply_addons(h, h_local, fragment_geometry)
+        return h_new, e_atom, gate_scores, aux_loss
 
 
 class AraceBackbone(nn.Module):
@@ -419,6 +381,12 @@ class AraceBackbone(nn.Module):
         Size of the embedding table (must exceed the largest Z).
     avg_num_neighbors : float, optional
         Edge → node aggregation normaliser for every ACE block.
+    fragment_interaction : dict, optional
+        Equivariant fragment-channel sub-config, applied to every block.
+        ``None`` (default) → disabled.
+    adaptive_gate : dict, optional
+        Adaptive depth-gate sub-config, applied to every block.
+        ``None`` (default) → disabled.
     """
 
     def __init__(
@@ -431,6 +399,8 @@ class AraceBackbone(nn.Module):
         embedding_dim: int = 32,
         num_elements: int = 120,
         avg_num_neighbors: float | None = None,
+        fragment_interaction: dict[str, typing.Any] | None = None,
+        adaptive_gate: dict[str, typing.Any] | None = None,
     ) -> None:
         super().__init__()
         if num_rounds < 1:
@@ -453,6 +423,15 @@ class AraceBackbone(nn.Module):
             artisan_cfg.get("hidden_irreps", "16x0e + 16x1o + 16x2e")
         )
         self._irreps_hidden: Irreps = hidden_irreps
+
+        # Optional add-on sub-configs — normalised the same way as in the
+        # modular backbone (empty section == disabled).
+        self._fragment_cfg: dict[str, typing.Any] | None = normalise_addon_config(
+            fragment_interaction
+        )
+        self._adaptive_gate_cfg: dict[str, typing.Any] | None = normalise_addon_config(
+            adaptive_gate
+        )
 
         # Initial node features: embedding lookup → equivariant space.
         self.embedding: AtomicNumberEmbedding = AtomicNumberEmbedding(
@@ -483,6 +462,8 @@ class AraceBackbone(nn.Module):
                 artisan_kwargs=artisan_cfg,
                 artisans=shared_bank,
                 avg_num_neighbors=avg_num_neighbors,
+                fragment_interaction_config=self._fragment_cfg,
+                adaptive_gate_config=self._adaptive_gate_cfg,
             )
             for _ in range(self._num_rounds)
         )
@@ -514,6 +495,16 @@ class AraceBackbone(nn.Module):
     def cutoff(self) -> float:
         return self._cutoff
 
+    @property
+    def fragment_interaction_enabled(self) -> bool:
+        """Whether the equivariant fragment channel is active in every block."""
+        return self._fragment_cfg is not None
+
+    @property
+    def adaptive_gate_enabled(self) -> bool:
+        """Whether the adaptive depth gate is active in every block."""
+        return self._adaptive_gate_cfg is not None
+
     def gates(self) -> dict[str, torch.Tensor]:
         """Snapshot of every artisan gate, keyed ``layer{L}/{pair}``."""
         result: dict[str, torch.Tensor] = {}
@@ -534,16 +525,28 @@ class AraceBackbone(nn.Module):
         edge_index: torch.Tensor,
         edge_vectors: torch.Tensor,
         edge_lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        fragment_geometry: FragmentGeometry | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor | None]]:
         """Run all rounds.
+
+        Parameters
+        ----------
+        atomic_numbers, edge_index, edge_vectors, edge_lengths
+            As before.
+        fragment_geometry : FragmentGeometry, optional
+            Fragment graph (centroids, pairs, spherical harmonics) — built
+            once per forward and required only when the fragment channel
+            is enabled.
 
         Returns
         -------
-        tuple of Tensor
-            ``(node_energies, layer_energies)`` where ``node_energies``
-            is the summed per-atom artisan energy ``(N,)`` and
-            ``layer_energies`` stacks the per-round per-atom
-            contributions ``(num_rounds, N)``.
+        tuple
+            ``(node_energies, layer_energies, total_aux_loss,
+            gate_scores_per_round)`` — the summed per-atom artisan energy
+            ``(N,)``, the per-round per-atom contributions
+            ``(num_rounds, N)``, the summed auxiliary loss over rounds
+            (0-d, zero when the gate is disabled) and one gate-score
+            tensor ``(N,)`` per round (``None`` entries when disabled).
         """
         h: torch.Tensor = self.input_linear(self.embedding(atomic_numbers))
 
@@ -556,12 +559,28 @@ class AraceBackbone(nn.Module):
         )
 
         per_layer: list[torch.Tensor] = []
+        gate_scores_per_round: list[torch.Tensor | None] = []
+        total_aux_loss: torch.Tensor = torch.zeros((), device=h.device, dtype=h.dtype)
         for block in self.blocks:
-            h, e_layer = block(h, atomic_numbers, edge_index, edge_sh, edge_lengths)
+            h, e_layer, gate_scores, aux_loss = block(
+                h,
+                atomic_numbers,
+                edge_index,
+                edge_sh,
+                edge_lengths,
+                fragment_geometry=fragment_geometry,
+            )
             per_layer.append(e_layer)
+            gate_scores_per_round.append(gate_scores)
+            total_aux_loss = total_aux_loss + aux_loss
 
         layer_energies: torch.Tensor = torch.stack(per_layer, dim=0)  # (L, N)
-        return layer_energies.sum(dim=0), layer_energies
+        return (
+            layer_energies.sum(dim=0),
+            layer_energies,
+            total_aux_loss,
+            gate_scores_per_round,
+        )
 
 
 @MODEL_REGISTRY.register("monolithic_arace")
@@ -602,6 +621,14 @@ class MonolithicArace(nn.Module):
         Multiplicative gain on the artisan interaction energy.
     num_elements_table : int
         Size of the Z-indexed atomic-energy parameter/buffer.
+    fragment_interaction : dict, optional
+        Equivariant fragment-channel sub-config — see
+        :class:`~goal.ml.nn.models.simurgh.backbone_arace.SimurghAraceBackbone`.
+        ``None`` (default) → disabled.
+    adaptive_gate : dict, optional
+        Adaptive depth-gate sub-config.  ``None`` (default) → disabled.
+        When enabled, ``forward`` returns an extra ``"aux_loss"`` entry
+        that ``GOALModule`` adds to the total training loss.
     """
 
     atomic_energies: torch.Tensor
@@ -620,6 +647,8 @@ class MonolithicArace(nn.Module):
         atomic_energies: dict[str, typing.Any] | None = None,
         scale: float | None = None,
         num_elements_table: int = 120,
+        fragment_interaction: dict[str, typing.Any] | None = None,
+        adaptive_gate: dict[str, typing.Any] | None = None,
     ) -> None:
         super().__init__()
         artisan_cfg: dict[str, typing.Any] | None = (
@@ -636,6 +665,8 @@ class MonolithicArace(nn.Module):
             avg_num_neighbors=(
                 float(avg_num_neighbors) if avg_num_neighbors is not None else None
             ),
+            fragment_interaction=fragment_interaction,
+            adaptive_gate=adaptive_gate,
         )
 
         # ----- Per-element atomic-energy baseline (3-mode contract) -----
@@ -706,8 +737,48 @@ class MonolithicArace(nn.Module):
     # Forward
     # ------------------------------------------------------------------
 
+    def _fragment_geometry(
+        self,
+        graph: AtomicGraph,
+        positions: torch.Tensor,
+    ) -> FragmentGeometry | None:
+        """Fragment centroids, pairs and SH for this batch, or ``None``.
+
+        Built once and shared by every block — the decomposition depends
+        only on geometry.  ``positions`` must be the tensor the energy is
+        differentiated against, or the fragment channel contributes
+        nothing to the forces.
+        """
+        if not self.backbone.fragment_interaction_enabled:
+            return None
+        fragment_index: torch.Tensor | None = graph.get("fragment_index", None)
+        if fragment_index is None:
+            raise ValueError(
+                "model.backbone.fragment_interaction is enabled but the graphs "
+                "carry no 'fragment_index'.  Set data.compute_fragment_index: "
+                "true in the config (and rebuild any cached dataset) so the "
+                "fragment labels are attached at load time."
+            )
+        module = typing.cast(AraceBlock, self.backbone.blocks[0]).fragment_interaction
+        assert module is not None  # guarded by fragment_interaction_enabled
+        return module.build_geometry(
+            positions=positions,
+            fragment_index=fragment_index,
+            batch=graph.get("batch", None),
+            cell=graph.get("cell", None),
+            pbc=graph.get("pbc", None),
+        )
+
     def forward(self, graph: AtomicGraph) -> dict[str, torch.Tensor]:
-        """Forward pass: dict with 'energy', 'forces', 'num_atoms', 'layer_energies'."""
+        """Forward pass: dict with 'energy', 'forces', 'num_atoms', 'layer_energies'.
+
+        With the adaptive depth gate enabled the dict also carries
+        ``"aux_loss"`` (0-d, grad-enabled — ``GOALModule`` adds it to the
+        total loss) and ``"gate_scores"`` (detached ``(L, N)`` per-round
+        gate values, logging only).  Both keys are absent when the gate is
+        disabled, so the loss and metric paths see exactly the dict they
+        saw before.
+        """
         positions: torch.Tensor = graph.pos
         positions.requires_grad_(True)
 
@@ -718,11 +789,14 @@ class MonolithicArace(nn.Module):
 
         node_energies: torch.Tensor
         layer_energies: torch.Tensor
-        node_energies, layer_energies = self.backbone(
+        total_aux_loss: torch.Tensor
+        gate_scores_per_round: list[torch.Tensor | None]
+        node_energies, layer_energies, total_aux_loss, gate_scores_per_round = self.backbone(
             atomic_numbers=graph.atomic_numbers,
             edge_index=edge_index,
             edge_vectors=edge_vectors,
             edge_lengths=edge_lengths,
+            fragment_geometry=self._fragment_geometry(graph, positions),
         )
 
         scale_v: torch.Tensor = self.scale.to(node_energies.dtype)
@@ -755,9 +829,20 @@ class MonolithicArace(nn.Module):
         )
         forces: torch.Tensor = -grad_outputs[0]  # (N, 3)
 
-        return {
+        out: dict[str, torch.Tensor] = {
             "energy": energy,
             "forces": forces,
             "num_atoms": num_atoms,
             "layer_energies": layer_totals,
         }
+        if self.backbone.adaptive_gate_enabled:
+            out["aux_loss"] = total_aux_loss
+            # (L, N) detached — mean per round is what gets logged.
+            out["gate_scores"] = torch.stack(
+                [
+                    g.detach() if g is not None else torch.zeros_like(node_energies)
+                    for g in gate_scores_per_round
+                ],
+                dim=0,
+            )
+        return out

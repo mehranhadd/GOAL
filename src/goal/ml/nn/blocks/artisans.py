@@ -1475,3 +1475,321 @@ class SimurghArtisanBank(nn.Module):
                 atom_energies = atom_energies.index_add(0, row, 0.5 * tapered_re)
 
         return atom_energies, atom_forces
+
+
+# ---------------------------------------------------------------------------
+# ARACE artisans (ARtisan + Atomic Cluster Expansion)
+# ---------------------------------------------------------------------------
+
+
+class _AracePairArtisan(nn.Module):
+    """One equivariant element-pair artisan for the ARACE variant.
+
+    Identical in spirit to :class:`_EquivariantArtisanCore`, but in
+    addition to the per-edge scalar energy it also *returns the
+    equivariant pair representation* ``h_pair`` so the ACE block can
+    aggregate it back onto nodes.  All learnable maps are bias-free so
+    zero-masked edges contribute exactly zero.
+
+    Every architectural dimension is exposed as a constructor argument
+    (``hidden_irreps``, ``num_layers``, ``num_rbf``, ``radial_hidden``,
+    ``n_scalar_out``, ``final_hidden``) so all of them are reachable
+    from Hydra configs and hyperparameter-search spaces.
+
+    Parameters mirror the ``artisan`` sub-config of the ARACE models;
+    see :class:`goal.ml.nn.models.simurgh.arace.MonolithicArace`.
+    """
+
+    def __init__(
+        self,
+        irreps_node: Irreps | str,
+        cutoff: float,
+        hidden_irreps: Irreps | str = "16x0e + 16x1o + 16x2e",
+        num_layers: int = 1,
+        num_rbf: int = 8,
+        radial_hidden: int = 32,
+        n_scalar_out: int = 16,
+        final_hidden: int = 16,
+        element_conditioned: bool = True,
+        n_elements: int = 120,
+    ) -> None:
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1, got {num_layers}.")
+        self.irreps_node: Irreps = Irreps(irreps_node)
+        self.irreps_hidden: Irreps = Irreps(hidden_irreps)
+        lmax: int = max((ir.l for _, ir in self.irreps_hidden), default=0)
+        self.irreps_edge: Irreps = build_artisan_edge_irreps(lmax)
+        self._element_conditioned: bool = bool(element_conditioned)
+        self._n_elements: int = int(n_elements)
+
+        # Shared symmetric node embedding — one map applied to both
+        # endpoints guarantees E(A, B) = E(B, A) under the sum.
+        self.node_embed: EquivariantLinear = EquivariantLinear(
+            self.irreps_node, self.irreps_hidden, biases=False
+        )
+
+        # CG tensor product with bond geometry.
+        self.tp: WeightedTensorProduct = WeightedTensorProduct(
+            irreps_in1=self.irreps_hidden,
+            irreps_in2=self.irreps_edge,
+            irreps_out=self.irreps_hidden,
+        )
+        self.radial_basis: BesselBasis = BesselBasis(num_basis=num_rbf, cutoff=cutoff)
+        self.envelope: PolynomialEnvelope = PolynomialEnvelope(cutoff=cutoff)
+        self.radial_mlp: RadialMLP = RadialMLP(
+            num_basis=num_rbf,
+            hidden_dim=radial_hidden,
+            num_out=self.tp.weight_numel,
+        )
+        self.element_linear: nn.Linear | None = (
+            nn.Linear(self._n_elements, self.tp.weight_numel, bias=False)
+            if element_conditioned
+            else None
+        )
+
+        # Optional deeper equivariant layers.
+        self.layers: nn.ModuleList = nn.ModuleList(
+            EquivariantLinear(self.irreps_hidden, self.irreps_hidden, biases=False)
+            for _ in range(num_layers - 1)
+        )
+        self.norms: nn.ModuleList = nn.ModuleList(
+            _PairRMSNorm(self.irreps_hidden) for _ in range(num_layers - 1)
+        )
+
+        # Invariant scalar readout (bias-free).
+        scalar_irreps: Irreps = Irreps(f"{int(n_scalar_out)}x0e")
+        self.to_scalars: EquivariantLinear = EquivariantLinear(
+            self.irreps_hidden, scalar_irreps, biases=False
+        )
+        self.energy_mlp: nn.Sequential = nn.Sequential(
+            nn.Linear(int(n_scalar_out), int(final_hidden), bias=False),
+            nn.SiLU(),
+            nn.Linear(int(final_hidden), 1, bias=False),
+        )
+
+        # Learnable gate, initialised to 1.0.
+        self.gate: nn.Parameter = nn.Parameter(torch.tensor(1.0))
+
+    def forward(
+        self,
+        feats_a: torch.Tensor,
+        feats_b: torch.Tensor,
+        edge_sh: torch.Tensor,
+        distances: torch.Tensor,
+        z_dst: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-edge pair representation and gated scalar energy.
+
+        Parameters
+        ----------
+        feats_a, feats_b : Tensor ``(E, irreps_node.dim)``
+            Equivariant node features of source / destination atom.
+        edge_sh : Tensor ``(E, irreps_edge.dim)``
+            Spherical harmonics of the edge direction.
+        distances : Tensor ``(E,)``
+            Bond lengths (zeros on masked edges are clamped internally).
+        z_dst : Tensor ``(E,)``, optional
+            Destination atomic numbers (element conditioning).
+
+        Returns
+        -------
+        tuple of Tensor
+            ``(h_pair, e_pair)`` with shapes ``(E, irreps_hidden.dim)``
+            and ``(E,)``; ``e_pair`` is already multiplied by the gate.
+        """
+        h_ab: torch.Tensor = self.node_embed(feats_a) + self.node_embed(feats_b)
+
+        d_safe: torch.Tensor = distances.clamp_min(1e-6)
+        rbf: torch.Tensor = self.radial_basis(d_safe)  # (E, num_rbf)
+        env: torch.Tensor = self.envelope(d_safe).to(h_ab.dtype).unsqueeze(-1)  # (E, 1)
+        radial_w: torch.Tensor = self.radial_mlp(rbf) * env  # (E, weight_numel)
+
+        if self._element_conditioned and self.element_linear is not None:
+            if z_dst is None:
+                raise ValueError("element_conditioned=True requires z_dst in forward()")
+            one_hot: torch.Tensor = F.one_hot(
+                z_dst.clamp(0, self._n_elements - 1),
+                num_classes=self._n_elements,
+            ).to(radial_w.dtype)
+            radial_w = radial_w * self.element_linear(one_hot)
+
+        h_pair: torch.Tensor = self.tp(h_ab, edge_sh.to(h_ab.dtype), radial_w)
+        for lin, norm in zip(self.layers, self.norms):
+            h_pair = norm(lin(h_pair) + h_pair)
+
+        scalars: torch.Tensor = self.to_scalars(h_pair)  # (E, n_scalar_out)
+        e_pair: torch.Tensor = self.gate * self.energy_mlp(scalars).squeeze(-1)  # (E,)
+        return h_pair, e_pair
+
+
+class ArtisanLayer(nn.Module):
+    """Routes all edges to their element-pair ARACE artisan.
+
+    One :class:`_AracePairArtisan` per unordered element pair.  Every
+    edge is routed to exactly one artisan with the same static-shape
+    zero-masking schedule as :class:`SimurghArtisanBank` (inputs masked
+    before the forward, outputs masked after — every artisan runs every
+    step, DDP-safe).  The masked per-edge features of all artisans are
+    summed into a single ``h_pair`` tensor (each edge matches exactly
+    one pair type, so the sum is a routed select).
+
+    Returns ``(h_pair, e_atom)`` per call — the equivariant edge
+    features for the downstream ACE aggregation and this layer's
+    per-atom energy contribution (gated, cosine-tapered, halved for the
+    bidirectional edge convention).
+
+    Parameters
+    ----------
+    elements : sequence of int
+        Atomic numbers covered by the model (defines the pair routing).
+    irreps_node : Irreps or str
+        Irreps of the node features entering the layer.  Must equal the
+        artisans' ``hidden_irreps`` so the edge → node aggregation and
+        the residual connection downstream are well-typed.
+    cutoff : float
+        Cutoff radius (Angstrom) for the radial basis and the cosine
+        taper on pair energies.
+    artisan_kwargs : dict, optional
+        Forwarded to every :class:`_AracePairArtisan` (``hidden_irreps``,
+        ``num_layers``, ``num_rbf``, ``radial_hidden``, ``n_scalar_out``,
+        ``final_hidden``, ``element_conditioned``, ``n_elements``).
+    artisans : nn.ModuleDict, optional
+        Pre-built artisan bank to **share** across layers
+        (``share_artisan_weights=True``).  When ``None`` the layer
+        builds its own independent bank.
+    """
+
+    def __init__(
+        self,
+        elements: typing.Sequence[int],
+        irreps_node: Irreps | str,
+        cutoff: float,
+        artisan_kwargs: dict[str, typing.Any] | None = None,
+        artisans: nn.ModuleDict | None = None,
+    ) -> None:
+        super().__init__()
+        self.irreps_node: Irreps = Irreps(irreps_node)
+        self._cutoff: float = float(cutoff)
+        self._pairs: tuple[tuple[int, int], ...] = tuple(enumerate_element_pairs(elements))
+        self._pair_keys: list[str] = [f"z{a}_z{b}" for a, b in self._pairs]
+
+        kwargs: dict[str, typing.Any] = dict(artisan_kwargs or {})
+        if artisans is not None:
+            self.artisans: nn.ModuleDict = artisans
+        else:
+            self.artisans = nn.ModuleDict(
+                {
+                    key: _AracePairArtisan(
+                        irreps_node=self.irreps_node, cutoff=cutoff, **kwargs
+                    )
+                    for key in self._pair_keys
+                }
+            )
+
+        first = typing.cast(_AracePairArtisan, self.artisans[self._pair_keys[0]])
+        if first.irreps_hidden != self.irreps_node:
+            raise ValueError(
+                f"Artisan hidden_irreps ({first.irreps_hidden}) must equal the "
+                f"node irreps ({self.irreps_node}) so the ACE aggregation and "
+                "residual are well-typed."
+            )
+        self.irreps_edge: Irreps = first.irreps_edge
+
+    @property
+    def pairs(self) -> tuple[tuple[int, int], ...]:
+        return self._pairs
+
+    @property
+    def cutoff(self) -> float:
+        return self._cutoff
+
+    def gates(self) -> dict[str, torch.Tensor]:
+        """Snapshot of every artisan gate, keyed by pretty pair label."""
+        result: dict[str, torch.Tensor] = {}
+        for (a, b), key in zip(self._pairs, self._pair_keys):
+            artisan = typing.cast(_AracePairArtisan, self.artisans[key])
+            result[pair_label(a, b)] = artisan.gate.detach()
+        return result
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        atomic_numbers: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_sh: torch.Tensor,
+        edge_lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run all pair artisans over the edges.
+
+        Parameters
+        ----------
+        h : Tensor ``(N, irreps_node.dim)``
+            Current equivariant node features.
+        atomic_numbers : Tensor ``(N,)``
+        edge_index : Tensor ``(2, E)``
+        edge_sh : Tensor ``(E, irreps_edge.dim)``
+            Pre-computed edge spherical harmonics (geometry only, shared
+            across all layers).
+        edge_lengths : Tensor ``(E,)``
+
+        Returns
+        -------
+        tuple of Tensor
+            ``(h_pair, e_atom)`` — routed equivariant edge features
+            ``(E, irreps_node.dim)`` and this layer's per-atom energy
+            contribution ``(N,)``.
+        """
+        num_atoms: int = h.shape[0]
+        device: torch.device = h.device
+        dtype: torch.dtype = h.dtype
+        row, col = edge_index
+        E: int = int(edge_lengths.shape[0])
+
+        e_atom: torch.Tensor = torch.zeros(num_atoms, device=device, dtype=dtype)
+
+        # ----- Degenerate case: no edges — keep every artisan reachable.
+        if E == 0:
+            dummy_feats: torch.Tensor = torch.zeros(
+                1, self.irreps_node.dim, device=device, dtype=dtype
+            )
+            dummy_sh: torch.Tensor = torch.zeros(
+                1, self.irreps_edge.dim, device=device, dtype=dtype
+            )
+            dummy_dist: torch.Tensor = torch.zeros(1, device=device, dtype=dtype)
+            dummy_z: torch.Tensor = torch.zeros(1, dtype=torch.long, device=device)
+            dummy_sum: torch.Tensor = torch.zeros((), device=device, dtype=dtype)
+            for key in self._pair_keys:
+                artisan = typing.cast(_AracePairArtisan, self.artisans[key])
+                h_p, e_p = artisan(dummy_feats, dummy_feats, dummy_sh, dummy_dist, dummy_z)
+                dummy_sum = dummy_sum + 0.0 * (h_p.sum() + e_p.sum())
+            h_pair_empty: torch.Tensor = torch.zeros(
+                0, self.irreps_node.dim, device=device, dtype=dtype
+            )
+            return h_pair_empty, e_atom + dummy_sum
+
+        edge_lengths = edge_lengths.to(dtype)
+        cut_env: torch.Tensor = cosine_cutoff(edge_lengths, self._cutoff).to(dtype)
+
+        z_row: torch.Tensor = atomic_numbers[row]
+        z_col: torch.Tensor = atomic_numbers[col]
+        z_lo: torch.Tensor = torch.minimum(z_row, z_col)
+        z_hi: torch.Tensor = torch.maximum(z_row, z_col)
+
+        h_pair_total: torch.Tensor = torch.zeros(
+            E, self.irreps_node.dim, device=device, dtype=dtype
+        )
+        for (a, b), key in zip(self._pairs, self._pair_keys):
+            artisan = typing.cast(_AracePairArtisan, self.artisans[key])
+            mask: torch.Tensor = ((z_lo == a) & (z_hi == b)).to(dtype)
+            mask_col: torch.Tensor = mask.unsqueeze(-1)
+            feats_a: torch.Tensor = h[row] * mask_col
+            feats_b: torch.Tensor = h[col] * mask_col
+            sh_in: torch.Tensor = edge_sh.to(dtype) * mask_col
+            dist_in: torch.Tensor = edge_lengths * mask
+            h_p, e_p = artisan(feats_a, feats_b, sh_in, dist_in, z_col)
+            h_pair_total = h_pair_total + h_p * mask_col
+            tapered: torch.Tensor = e_p * mask * cut_env
+            e_atom = e_atom.index_add(0, row, 0.5 * tapered)
+
+        return h_pair_total, e_atom

@@ -60,6 +60,7 @@ goal-train = "goal.ml.cli.train:train_ml"
 goal-train-ml = "goal.ml.cli.train:train_ml"
 goal-eval = "goal.ml.cli.evaluate:evaluate"
 goal-finetune = "goal.ml.cli.finetune:finetune"
+goal-finetune-upet = "goal.ml.cli.finetune_upet:main"
 goal-tune = "goal.ml.cli.tune:tune"
 goal-simulate = "goal.md.cli.simulate:simulate"
 goal-simulate-mts = "goal.md.cli.simulate:simulate_mts"
@@ -86,6 +87,7 @@ filterwarnings = [
 log_cli = "True"
 markers = [
   "slow: slow tests",
+  "integration: tests that require an actual foundation model / external engine installed",
 ]
 minversion = "6.0"
 testpaths = ["tests/", "tests/ml/", "tests/md/"]
@@ -108,6 +110,7 @@ platforms = ["linux-64", "linux-aarch64"]
 
 [tool.pixi.dependencies]
 python = "3.14.*"
+dftd3-python = ">=1.4.0,<2"
 
 [tool.pixi.pypi-dependencies]
 goal = { path = ".", editable = true }
@@ -146,18 +149,56 @@ pytest-cov = "*"
 # --- Optional adapter features ---
 # Some optional deps have Python version or e3nn version conflicts with
 # the core environment.  They are available as pip extras — install via:
-#   pip install -e ".[mace]"           # MACE adapter (pins e3nn==0.4.4)
 #   pip install -e ".[fairchem]"       # FairChem adapter
 #   pip install -e ".[nvalchemiops]"   # NVIDIA GPU neighbour list (CUDA-only)
 #   pip install -e ".[tune]"           # Ray Tune + Optuna (needs Python ≤3.13)
 #   pip install -e ".[all]"            # everything
+#   For [mace], see "MACE (mace-torch)" below — the [mace] extra itself is NOT
+#   installable (see why).
+#
+# Note: pixi's uv-managed envs don't ship a `pip` binary — use `uv pip install
+# --python <env>/bin/python ...` instead of plain `pip install` inside them.
 #
 # Pixi features are provided where compatible.  Features that cannot be
 # resolved in the pixi environment (e3nn conflict, missing cp314 wheels)
 # are commented out — users should fall back to pip install for those.
 
+# --- MACE (mace-torch) ---
+# mace-torch hard-pins e3nn==0.4.4, while GOAL's own equivariant blocks (SIMURGH/
+# ARACE etc.) require e3nn>=0.5 (currently 0.6.x). Because of that, `goal[mace]`
+# (the [mace] extra) is unsatisfiable by construction — uv/pip must resolve both
+# constraints in one graph and there is no version of e3nn that fits both.
+#
+# Don't try to satisfy this inside a pixi-managed environment, even an isolated
+# one (`pixi install -e <name>` followed by a manual `uv pip install mace-torch`
+# downgrade) — it looks like it works, but pixi doesn't track that downgrade, and
+# the NEXT `pixi install`/`pixi run` (e.g. whatever launches your Jupyter kernel)
+# silently reconciles e3nn back to what pixi.lock says (0.6.x), breaking mace_mp()
+# again with a confusing "too many values to unpack" error deep in
+# e3nn/util/codegen/_mixin.py — this happened during development and cost a lot
+# of debugging before the cause (pixi env drift, not a real bug) was found.
+#
+# Instead, use a plain venv that pixi never touches:
+#   uv venv --python 3.14 .venv-mace
+#   uv pip install --python .venv-mace/bin/python torch --index-url https://download.pytorch.org/whl/cu126
+#   uv pip install --python .venv-mace/bin/python -e .
+#   uv pip install --python .venv-mace/bin/python "mace-torch>=0.3.16" jupyter ipykernel
+#   .venv-mace/bin/python -m ipykernel install --user --name goal-mace-cuda \
+#       --display-name "GOAL (mace-cuda, standalone)"
+# Then select the "GOAL (mace-cuda, standalone)" kernel for MACE notebooks (e.g.
+# notebooks/mof74_mn_bulk.ipynb) instead of any pixi-provided kernel.
+#
+# Also: e3nn==0.4.4's bundled Wigner-3j constants are loaded via a bare
+# `torch.load(...)`, which torch>=2.6 now blocks by default (weights_only=True).
+# Before importing mace/e3nn, run:
+#   import torch; torch.serialization.add_safe_globals([slice])
+# (already done in notebooks/mof74_mn_bulk.ipynb). Verified working end-to-end in
+# `.venv-mace` with Python 3.14 + torch 2.13+cu126 + e3nn 0.4.4 + mace-torch 0.3.16
+# — mace_mp() loads a real checkpoint on GPU, and goal.ml.data.graph.AtomicGraph
+# (used by that notebook) still imports fine since it doesn't touch e3nn's API.
+
 # [tool.pixi.feature.mace.pypi-dependencies]
-# mace-torch = ">=0.3"            # conflicts: pins e3nn==0.4.4
+# mace-torch = ">=0.3"            # conflicts: pins e3nn==0.4.4 — use the standalone .venv-mace instead (see above)
 
 [tool.pixi.feature.fairchem.pypi-dependencies]
 fairchem-core = ">=1.0"
@@ -187,7 +228,7 @@ dev-cuda = ["cuda", "dev"]
 fairchem = ["cuda", "fairchem"]
 cuda-deepspeed = ["cuda", "deepspeed"]
 examples = ["cuda", "examples"]
-# mace = ["cuda", "mace"]          # pip install -e ".[mace]" instead
+# mace = ["cuda", "mace"]          # doesn't work — see "MACE (mace-torch)" comment above; use .venv-mace instead
 # tune = ["cpu", "tune"]            # pip install -e ".[tune]" instead
 # cuda-tune = ["cuda", "tune"]
 # cuda-nvalchemiops = ["cuda", "nvalchemiops"]  # uncomment when cp314 wheels land

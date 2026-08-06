@@ -259,7 +259,13 @@ def _run_training(cfg: DictConfig) -> None:
     # the dataset is always authoritative. Other backbones (hyperspec,
     # invariant_gnn) use a fixed-size embedding table and ignore this key.
     backbone_name: str = cfg.model.backbone.name
-    if backbone_name in ("simurgh", "simurgh_monolithic", "monolithic_arace"):
+    if backbone_name in (
+        "simurgh",
+        "simurgh_ace_first",
+        "simurgh_arace",
+        "simurgh_monolithic",
+        "monolithic_arace",
+    ):
         elements: list[int] = compute_unique_elements(datamodule.data_train)
         symbol_str: str = " ".join(f"{ATOMIC_SYMBOLS.get(z, '?')}({z})" for z in elements)
         print(f"[stats] elements discovered in training set: {symbol_str}")
@@ -308,6 +314,13 @@ def _run_training(cfg: DictConfig) -> None:
             dressing_dict["avg_num_neighbors"] = avg_nn
             backbone_kwargs["dressing_kwargs"] = dressing_dict
             print(f"[stats] avg_num_neighbors={avg_nn:.4f}")
+
+    # avg_num_neighbors for the ARACE backbone — it has no dressing_kwargs
+    # sub-config; the normaliser is a top-level backbone key instead.
+    if backbone_name == "simurgh_arace" and backbone_kwargs.get("avg_num_neighbors") is None:
+        avg_nn_arace: float = compute_avg_num_neighbors(datamodule.data_train)
+        backbone_kwargs["avg_num_neighbors"] = avg_nn_arace
+        print(f"[stats] avg_num_neighbors={avg_nn_arace:.4f}")
 
     # pair_counts — for data-driven expert routing.
     # Injected when the backbone has an artisan_config with rare_artisan.enabled=true.

@@ -14,9 +14,9 @@ import typing
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from goal.ml.data.graph import AtomicGraph, NodeFeatures
-from goal.ml.registry import BACKBONE_REGISTRY
 
 
 def _require_fairchem() -> None:
@@ -31,8 +31,14 @@ def _require_fairchem() -> None:
         ) from None
 
 
-class UMAAdapter:
+class UMAAdapter(nn.Module):
     """Wraps a pre-trained FairChem UMA / EquiformerV2 model as a GOAL backbone.
+
+    As an ``nn.Module`` it registers ``self._model`` as a submodule so the
+    FairChem parameters are part of the owning ``GOALModule``.  For
+    *fine-tuning* UMA as a monolithic energy/force backbone, prefer
+    :class:`goal.ml.nn.models.foundation.uma.UMAFinetune`; this adapter is for
+    feature extraction / inference.
 
     Parameters
     ----------
@@ -43,6 +49,7 @@ class UMAAdapter:
     """
 
     def __init__(self, fairchem_model: typing.Any, dtype: torch.dtype = torch.float64) -> None:
+        super().__init__()
         _require_fairchem()
         self._model: typing.Any = fairchem_model
         self.dtype: torch.dtype = dtype
@@ -132,9 +139,9 @@ class UMAAdapter:
             "natoms": graph.num_atoms,
         }
 
-    def parameters(self) -> typing.Iterator[typing.Any]:
-        """Proxy to underlying model parameters (for freezing)."""
-        return self._model.parameters()
+    # NOTE: parameters()/named_parameters() are inherited from nn.Module;
+    # ``self._model`` is a registered submodule so they include the FairChem
+    # weights automatically — no manual proxy needed.
 
     def requires(self) -> list[str]:
         """Required pip packages for this adapter."""

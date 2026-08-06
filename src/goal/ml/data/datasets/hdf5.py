@@ -32,6 +32,11 @@ class HDF5Dataset(BaseAtomicDataset):
         Cutoff radius used during preprocessing (stored as metadata).
     split : str
         Which split to load — looks for ``{split}.h5`` inside *root*.
+    compute_fragment_index : bool
+        Attach connected-component ``fragment_index`` labels to every
+        graph (needed by the fragment-interaction module).
+    fragment_covalent_cutoff : float
+        Bond threshold for the fragment decomposition (Angstrom).
     """
 
     def __init__(
@@ -40,8 +45,27 @@ class HDF5Dataset(BaseAtomicDataset):
         cutoff: float,
         split: str = "train",
         dtype: torch.dtype = torch.float64,
+        compute_fragment_index: bool = False,
+        fragment_covalent_cutoff: float = 1.8,
+        fragment_scheme: str = "connected",
+        fragment_charge: int = 0,
+        fragment_on_failure: str = "fallback",
+        fragment_smarts: typing.Sequence[str] | None = None,
+        fragment_keep_groups: typing.Sequence[str] | None = None,
     ) -> None:
-        super().__init__(root=root, cutoff=cutoff, split=split, dtype=dtype)
+        super().__init__(
+            root=root,
+            cutoff=cutoff,
+            split=split,
+            dtype=dtype,
+            compute_fragment_index=compute_fragment_index,
+            fragment_covalent_cutoff=fragment_covalent_cutoff,
+            fragment_scheme=fragment_scheme,
+            fragment_charge=fragment_charge,
+            fragment_on_failure=fragment_on_failure,
+            fragment_smarts=fragment_smarts,
+            fragment_keep_groups=fragment_keep_groups,
+        )
         self._file: typing.Any = None
         self._keys: list[str] = []
         self._open()
@@ -70,7 +94,7 @@ class HDF5Dataset(BaseAtomicDataset):
                 return torch.tensor(grp[name][()], dtype=dtype)
             return None
 
-        return AtomicGraph(
+        graph: AtomicGraph = AtomicGraph(
             positions=_tensor("positions"),
             atomic_numbers=_tensor("atomic_numbers", dtype=torch.long),
             cell=_tensor("cell"),
@@ -83,6 +107,7 @@ class HDF5Dataset(BaseAtomicDataset):
             stress=_tensor("stress"),
             weight=_tensor("weight"),
         )
+        return self.attach_fragment_index(graph)
 
     def __del__(self) -> None:
         if self._file is not None:
