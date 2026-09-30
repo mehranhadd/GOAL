@@ -4,7 +4,7 @@ Supports:
 - ML models trained in goal.ml (via checkpoint loading)
 - Quantum chemistry: ORCA, CP2K, Quantum ESPRESSO, VASP, PSI4
 - Pretrained models: MACE, NequIP, FlashMD, UPET
-- Semi-empirical: xTB
+- Semi-empirical: xTB, TBLite
 """
 
 from __future__ import annotations
@@ -61,6 +61,12 @@ except ImportError:
     HAS_XTB = False
 
 try:
+    from tblite.ase import TBLite
+    HAS_TBLITE= True
+except ImportError:
+    HAS_TBLITE= False
+
+try:
     import nequip  # noqa: F401
 
     HAS_NEQUIP = True
@@ -106,7 +112,7 @@ except ImportError:  # pragma: no cover — exercised only without upet installe
         "pet-oam-l", "pet-oam-xl",
         "pet-omad-xs", "pet-omad-s", "pet-omad-l",
         "pet-omatpes-l",
-        "pet-spice-s", "pet-spice-l",
+            "pet-spice-s", "pet-spice-l",
     ]
 
 _UPET_MODELS: frozenset[str] = frozenset(_UPET_MODEL_LIST)
@@ -1257,6 +1263,69 @@ class XTBBuilder(CalculatorBuilder):
             kwargs["solvent"] = solvent
 
         return XTB(**kwargs)
+
+
+@register_calculator("tblite")
+class TBLiteBuilder(CalculatorBuilder):
+    """Create TBLite semi-empirical calculator (GFN2-xTB by default)."""
+
+    def build(
+        self,
+        method: str = "GFN2-xTB",
+        charge: int = 0,
+        uhf: int = 0,
+        accuracy: float = 1.0,
+        electronic_temperature: float = 300.0,
+        max_iterations: int = 250,
+        solvent: str | None = None,
+    ) -> ase.calculators.calculator.Calculator:
+        """Create TBLite semi-empirical calculator.
+
+        Parameters
+        ----------
+        method : str
+            TBLite method: ``"GFN1-xTB"`` or ``"GFN2-xTB"`` (default).
+        charge : int
+            Total molecular charge.
+        uhf : int
+            Number of unpaired electrons.
+        accuracy : float
+            Numerical accuracy (1.0 = default).
+        electronic_temperature : float
+            Fermi smearing temperature in Kelvin.
+        max_iterations : int
+            Maximum SCF iterations.
+        solvent : str, optional
+            Implicit solvent name (e.g. ``"water"``).
+
+        Returns
+        -------
+        tblite.ase.TBLite
+            TBLite calculator instance.
+
+        Raises
+        ------
+        ImportError
+            If ``tblite`` is not installed.
+        """
+        if not HAS_TBLITE:
+            raise ImportError(
+                "tblite not installed. Install by following the instructions on https://tblite.readthedocs.io/en/latest/installation.html#python-build "
+                # "or: pip install 'goal[md]'"
+            )
+
+        kwargs: dict[str, typing.Any] = dict(
+            method=method,
+            charge=charge,
+            uhf=uhf,
+            accuracy=accuracy,
+            electronic_temperature=electronic_temperature,
+            max_iterations=max_iterations,
+        )
+        if solvent is not None:
+            kwargs["solvent"] = solvent
+
+        return TBLite(**kwargs)
 
 
 # ============================================================================
