@@ -62,9 +62,10 @@ except ImportError:
 
 try:
     from tblite.ase import TBLite
-    HAS_TBLITE= True
+
+    HAS_TBLITE = True
 except ImportError:
-    HAS_TBLITE= False
+    HAS_TBLITE = False
 
 try:
     import nequip  # noqa: F401
@@ -107,12 +108,21 @@ try:
     from upet._version import UPET_AVAILABLE_MODELS as _UPET_MODEL_LIST
 except ImportError:  # pragma: no cover — exercised only without upet installed
     _UPET_MODEL_LIST = [
-        "pet-mad-xs", "pet-mad-s",
-        "pet-omat-xs", "pet-omat-s", "pet-omat-m", "pet-omat-l", "pet-omat-xl",
-        "pet-oam-l", "pet-oam-xl",
-        "pet-omad-xs", "pet-omad-s", "pet-omad-l",
+        "pet-mad-xs",
+        "pet-mad-s",
+        "pet-omat-xs",
+        "pet-omat-s",
+        "pet-omat-m",
+        "pet-omat-l",
+        "pet-omat-xl",
+        "pet-oam-l",
+        "pet-oam-xl",
+        "pet-omad-xs",
+        "pet-omad-s",
+        "pet-omad-l",
         "pet-omatpes-l",
-            "pet-spice-s", "pet-spice-l",
+        "pet-spice-s",
+        "pet-spice-l",
     ]
 
 _UPET_MODELS: frozenset[str] = frozenset(_UPET_MODEL_LIST)
@@ -829,9 +839,7 @@ class CP2KBuilder(CalculatorBuilder):
         """Build the standalone dispersion calculator (currently ``d3bj``)."""
         key = dispersion.lower().replace("-", "").replace("_", "")
         if key not in ("d3bj", "d3"):
-            raise ValueError(
-                f"Unsupported dispersion {dispersion!r}; only 'd3bj' is implemented."
-            )
+            raise ValueError(f"Unsupported dispersion {dispersion!r}; only 'd3bj' is implemented.")
         try:
             from dftd3.ase import DFTD3
         except ImportError as exc:

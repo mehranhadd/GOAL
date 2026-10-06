@@ -12,7 +12,7 @@ Override molecule and output directory::
 
 Run a pre-configured MTS simulation::
 
-    goal-simulate --config-name md/simulations/mts_respa
+    goal-simulate --config-name mts/simulations/mts_respa
 
 With a trained goal.ml model::
 
@@ -29,6 +29,7 @@ from omegaconf import DictConfig
 log = logging.getLogger(__name__)
 
 from goal.md.cli import CONFIGS_MD_DIR
+
 
 @hydra.main(
     version_base="1.3",

@@ -25,7 +25,7 @@ with initialize_config_dir(
 
 ## Example: Using a Trained Model
 
-See `simulations/langevin_with_model.yaml` for a complete example that:
+See `langevin_with_model_sim.yaml` for a complete example that:
 1. Creates molecule from SMILES
 2. Loads a trained model from goal.ml
 3. Runs Langevin MD at 300 K

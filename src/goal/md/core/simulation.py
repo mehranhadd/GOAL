@@ -13,10 +13,12 @@ Usage patterns
     from goal.md.core.simulation import Simulation
     from goal.md.core.molecule_factory import MoleculeFactory
     from goal.md.core.calculator_factory import CalculatorFactory
+    from goal.md.core.md_factory import DynamicsFactory
 
     atoms = MoleculeFactory.create("from_smiles", smiles="CCO")
     calc  = CalculatorFactory.create("goal_model", checkpoint="model.ckpt")
-    sim   = Simulation(atoms, calc, steps=5000, temperature_K=300.0)
+    dyn   = DynamicsFactory.create("langevin_ase", atoms) 
+    sim   = Simulation(atoms, calc, dyn, steps=5000, temperature_K=300.0)
     result = sim.run()
 
 **Config-first (Hydra)**::
@@ -25,7 +27,7 @@ Usage patterns
     from goal.md.core.simulation import simulate_from_config
 
     with initialize_config_dir(config_dir="configs/"):
-        cfg = compose("md/simulations/langevin_with_model")
+        cfg = compose("md/langevin_with_model_sim")
     result = simulate_from_config(cfg)
 """
 
@@ -202,7 +204,7 @@ class Simulation:
 
         - ``molecule`` — passed to :meth:`MoleculeFactory.create`
         - ``calculator`` — passed to :meth:`CalculatorFactory.create`
-        - ``dynamics`` — mapping with ``type`` key and dynamics parameters
+        - ``dynamics`` — passed to :meth:`DynamicsFactory.create`
         - All optional fields of :class:`SimulationConfig`
 
         Parameters
@@ -243,7 +245,13 @@ class Simulation:
         sim_keys = {f.name for f in dataclasses.fields(SimulationConfig)}
         sim_params = {k: v for k, v in cfg.items() if k in sim_keys}
 
-        return cls(atoms=atoms, calculator=calculator, dynamics=dynamics, temperature_K=dyn_cfg.get("temperature_K", 300.0), **sim_params)
+        return cls(
+            atoms=atoms,
+            calculator=calculator,
+            dynamics=dynamics,
+            temperature_K=dyn_cfg.get("temperature_K", 300.0),
+            **sim_params,
+        )
 
 
 def simulate_from_config(cfg: typing.Any) -> RunResult:
@@ -251,7 +259,7 @@ def simulate_from_config(cfg: typing.Any) -> RunResult:
 
     Designed to be the ``_target_`` in simulation config files::
 
-        # configs/md/simulations/langevin_with_model.yaml
+        # configs/md/langevin_with_model_sim.yaml
         _target_: goal.md.core.simulation.simulate_from_config
 
     Parameters
