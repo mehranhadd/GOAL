@@ -7,7 +7,7 @@
 #  _target_: goal.md.core.calculator_factory.CalculatorFactory.create
 #  _convert_: none
 
-type: tblite
+key: tblite
 method: GFN2-xTB # GFN1-xTB or GFN2-xTB
 charge: 0
 uhf: 0

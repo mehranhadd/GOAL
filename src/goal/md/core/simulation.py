@@ -13,12 +13,10 @@ Usage patterns
     from goal.md.core.simulation import Simulation
     from goal.md.core.molecule_factory import MoleculeFactory
     from goal.md.core.calculator_factory import CalculatorFactory
-    from goal.md.core.md_factory import DynamicsFactory
 
     atoms = MoleculeFactory.create("from_smiles", smiles="CCO")
     calc  = CalculatorFactory.create("goal_model", checkpoint="model.ckpt")
-    dyn   = DynamicsFactory.create("langevin_ase", atoms) 
-    sim   = Simulation(atoms, calc, dyn, steps=5000, temperature_K=300.0)
+    sim   = Simulation(atoms, calc, steps=5000, temperature_K=300.0)
     result = sim.run()
 
 **Config-first (Hydra)**::
@@ -27,7 +25,7 @@ Usage patterns
     from goal.md.core.simulation import simulate_from_config
 
     with initialize_config_dir(config_dir="configs/"):
-        cfg = compose("md/langevin_with_model_sim")
+        cfg = compose("md/simulations/langevin_with_model")
     result = simulate_from_config(cfg)
 """
 
@@ -75,12 +73,12 @@ class Simulation:
         The molecular system to simulate.
     calculator : ase.calculators.calculator.Calculator
         Force/energy calculator.
-    dynamics : object
-        Dynaimcs for the simulation.
-    temperature_K: float
-        Target temperature in Kelvin.
+    dynamics_cfg: dict
+        The dynamics config dictionary.
     steps : int
         Number of MD steps.
+    temperature_K: float
+        Obtained from `dynamics_cfg`. Target temperature in Kelvin.
     chunk_size : int
         Steps per ``dynamics.run()`` call (for progress and restarts).
     restart_thermostat : bool
@@ -104,8 +102,7 @@ class Simulation:
         self,
         atoms: Atoms,
         calculator: Calculator,
-        dynamics: object,
-        temperature_K: float = 300.0,
+        dynamics_cfg: dict = {},
         steps: int = 1000,
         chunk_size: int = 100,
         restart_thermostat: bool = False,
@@ -119,8 +116,9 @@ class Simulation:
         self.atoms = atoms
         self.atoms.calc = calculator
         self.calculator = calculator
-        self.temperature_K = temperature_K
+        self.dynamics_cfg = dynamics_cfg
         self.steps = steps
+        self.temperature_K: float = dynamics_cfg.get("temperature_K", 300.0) # Target temperature in Kelvin.
         self.chunk_size = chunk_size
         self.restart_thermostat = restart_thermostat
         self.log_interval = log_interval
@@ -131,7 +129,7 @@ class Simulation:
         self._traj_file = self._resolve_path(trajectory_file)
         self._log_file = self._resolve_path(log_file)
 
-        self._dynamics: object = dynamics
+        self._dynamics: Object | None = None
         self._observers: dict[str, typing.Any] = {}
 
     # ------------------------------------------------------------------
@@ -146,16 +144,43 @@ class Simulation:
             return str(self.output_dir / p)
         return str(p)
 
+    def _build_dynamics(self) -> Object:
+        from goal.md.core.md_factory import DynamicsFactory
+
+        dyn_method = self.dynamics_cfg.pop("method", "langevin_ase")
+        
+        if dyn_method == "langevin_ase":
+            timestep: float = self.dynamics_cfg.pop("timestep_fs", 1.0) * units.fs
+            self.dynamics_cfg.setdefault("friction", 0.5)
+            self.dynamics_cfg["friction"] /= units.fs
+            dyn = DynamicsFactory.create(
+                dyn_method,
+                self.atoms,
+                timestep,
+                **self.dynamics_cfg
+                )
+        
+        else:
+            dyn = DynamicsFactory.create(
+                    dyn_method,
+                    self.atoms,
+                    **self.dynamics_cfg
+                    )
+        return dyn
+
     def _setup(self) -> None:
         """Prepare dynamics and observers (idempotent)."""
+        if self._dynamics is not None:
+            return
 
         if self.initialise_velocities:
             MaxwellBoltzmannDistribution(self.atoms, temperature_K=self.temperature_K)
 
+        self._dynamics = self._build_dynamics()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self._observers = setup_observers(
-            dynamics=self.dynamics,
+            dynamics=self._dynamics,
             atoms=self.atoms,
             trajectory_file=self._traj_file,
             log_file=self._log_file,
@@ -168,8 +193,10 @@ class Simulation:
     # ------------------------------------------------------------------
 
     @property
-    def dynamics(self) -> object:
-        """The underlying ASE dynamics object."""
+    def dynamics(self) -> Langevin:
+        """The underlying ASE dynamics object (created on first access)."""
+        if self._dynamics is None:
+            self._setup()
         return self._dynamics  # type: ignore[return-value]
 
     def run(self) -> RunResult:
@@ -182,7 +209,7 @@ class Simulation:
         """
         self._setup()
         return run_dynamics(
-            dynamics=self.dynamics,
+            dynamics=self._dynamics,
             steps=self.steps,
             chunk_size=self.chunk_size,
             restart_thermostat=self.restart_thermostat,
@@ -204,7 +231,7 @@ class Simulation:
 
         - ``molecule`` — passed to :meth:`MoleculeFactory.create`
         - ``calculator`` — passed to :meth:`CalculatorFactory.create`
-        - ``dynamics`` — passed to :meth:`DynamicsFactory.create`
+        - ``dynamics`` — passed to :meth: `DynamicsFactory.create` in `_build_dynamics` method
         - All optional fields of :class:`SimulationConfig`
 
         Parameters
@@ -217,7 +244,6 @@ class Simulation:
         Simulation
         """
         from goal.md.core.calculator_factory import CalculatorFactory
-        from goal.md.core.md_factory import DynamicsFactory
         from goal.md.core.molecule_factory import MoleculeFactory
 
         # Build molecule
@@ -230,28 +256,19 @@ class Simulation:
         calc_key = calc_cfg.pop("type", calc_cfg.pop("key", "goal_model"))
         calculator = CalculatorFactory.create(calc_key, **calc_cfg)
 
-        # Build Dynamics
+        # Dynamics Parameters
         dyn_cfg = dict(cfg.get("dynamics", {}))
-        dyn_method = dyn_cfg.pop("method", "langevin_ase")
-        if dyn_method == "langevin_ase":
-            timestep = dyn_cfg.pop("timestep_fs", 1.0) * units.fs
-            dyn_cfg.setdefault("friction", 0.5)
-            dyn_cfg["friction"] /= units.fs
-            dynamics = DynamicsFactory.create(dyn_method, atoms, timestep, **dyn_cfg)
-        else:
-            dynamics = DynamicsFactory.create(dyn_method, atoms, **dyn_cfg)
 
         # Simulation parameters
         sim_keys = {f.name for f in dataclasses.fields(SimulationConfig)}
         sim_params = {k: v for k, v in cfg.items() if k in sim_keys}
 
         return cls(
-            atoms=atoms,
-            calculator=calculator,
-            dynamics=dynamics,
-            temperature_K=dyn_cfg.get("temperature_K", 300.0),
-            **sim_params,
-        )
+                atoms=atoms,
+                calculator=calculator,
+                dynamics_cfg=dyn_cfg,
+                **sim_params
+                   )
 
 
 def simulate_from_config(cfg: typing.Any) -> RunResult:
@@ -259,7 +276,7 @@ def simulate_from_config(cfg: typing.Any) -> RunResult:
 
     Designed to be the ``_target_`` in simulation config files::
 
-        # configs/md/langevin_with_model_sim.yaml
+        # configs/md/simulations/langevin_with_model.yaml
         _target_: goal.md.core.simulation.simulate_from_config
 
     Parameters

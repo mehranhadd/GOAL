@@ -6,7 +6,7 @@
 #  _target_: goal.md.core.calculator_factory.CalculatorFactory.create
 #  _convert_: none
 
-method: goal_model
+key: goal_model
 checkpoint: ??? # Path to model checkpoint
 cutoff: null # Read from checkpoint if null
 device: cpu
